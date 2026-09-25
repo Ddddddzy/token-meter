@@ -1,0 +1,7 @@
+# token-meter：只跟踪源码，排除大体积/本机状态文件
+# lib/ = WebView2 SDK（约54MB，需要时从微软官网重新下）
+lib/
+_tray_err.txt
+ui-settings.json
+node_modules/
+*.log
