@@ -67,6 +67,18 @@ const FAST = {
   'grok-4.5': [4, 1, 18],
   'composer-2.5': [3, 0.50, 15],
 };
+// LiteLLM 价目表快照（TokenBar model_prices.json，{i,o,r,w} = $/1M 输入/输出/缓存读/缓存写）。
+// 只做精确匹配——子串匹配会把 gpt-5 错接到 gpt-5.6-sol 上按错代次计价（TokenBar 踩过）。
+const PRICES = (() => {
+  try { return JSON.parse(fs.readFileSync(path.join(path.dirname(process.argv[1]), 'model_prices.json'), 'utf8')); } catch { return {}; }
+})();
+function litellmRate(m) {
+  const bare = m.includes('/') ? m.slice(m.lastIndexOf('/') + 1) : m;
+  const e = PRICES[m] || PRICES[bare];
+  if (!e || e.i == null) return null;
+  // r 缺失按输入价 10% 估缓存读（各家缓存读折扣集中在 10%~50%，取保守低值）；w 缺失按输入价
+  return { rate: [e.i, e.r ?? e.i * 0.1, e.o, e.w ?? e.i], kind: 'list' };
+}
 function rateFor(model) {
   const m = (model || '').toLowerCase();
   if (!m || m.includes('free')) return null;
@@ -75,13 +87,13 @@ function rateFor(model) {
     for (const k of keys) if (m.includes(k)) return { rate: table[k], kind };
     return null;
   };
-  const hit = pick(LIST, 'list') || pick(PROXY, 'proxy');
+  const hit = pick(LIST, 'list') || litellmRate(m) || pick(PROXY, 'proxy');
   if (!hit || !m.includes('fast')) return hit;
   const fast = pick(FAST, hit.kind);
   return fast || hit;
 }
 function listUsd(r, rate) {
-  return (r.in * rate[0] + r.cr * rate[1] + (r.cw || 0) * rate[0] + r.out * rate[2]) / 1e6;
+  return (r.in * rate[0] + r.cr * rate[1] + (r.cw || 0) * (rate[3] ?? rate[0]) + r.out * rate[2]) / 1e6;
 }
 
 // ---------- 扫描器 ----------
@@ -111,69 +123,205 @@ function closeDb(db) {
   if (db._tmp) for (const s of ['', '-wal', '-shm']) try { fs.unlinkSync(db._tmp + s); } catch {}
 }
 
-function scanCmdc() {
-  const out = [];
-  for (const f of jsonlFiles(`${H}/.commandcode/projects`))
+// Claude Code 系格式（claude / cmdc）的 jsonl 扫描器。
+// 记录是流式递增快照：同一条 assistant 消息会写多行 usage（output 1→1→279），
+// 跨文件 resume/fork 还会把父会话记录原样抄写。按 message.id:requestId 复合键
+// 全局去重、逐字段取最大值——TokenBar 实测朴素求和虚高 1.79x。
+// subagents/**/journal.jsonl 是编排日志不是消息记录，排除。
+function isWorkflowJournal(f) {
+  if (!f.endsWith('journal.jsonl')) return false;
+  return f.split(/[\\/]/).includes('subagents');
+}
+function scanClaudeLike(dir, cli, opt) {
+  const best = new Map(); // key -> rec（值就地取字段最大）
+  for (const f of jsonlFiles(dir)) {
+    if (isWorkflowJournal(f)) continue;
     for (const line of fs.readFileSync(f, 'utf8').split('\n')) {
       if (!line.includes('"usage"')) continue;
       try {
         const j = JSON.parse(line);
+        // claude 写 type:'assistant'，cmdc 写 type:'message'，其余类型（user/summary 等）不带 usage
+        if (j.type && j.type !== 'assistant' && j.type !== 'message') continue;
+        const msg = j.message || j;
         const u = j.message?.usage || j.usage; if (!u) continue;
-        // inputTokens 已含 cacheRead。costUsd 是 CLI 本地 estimateSessionCostUsd，不是账单。
+        const model = msg.model || j.model || '?'; // cmdc 的 model 在顶层
+        if (model === '<synthetic>') continue; // 本地记账条目，不是真实调用
         const rawIn = u.inputTokens || u.input_tokens || 0;
         const cr = u.cacheReadTokens || u.cache_read_input_tokens || 0;
         const cw = u.cacheWriteTokens || u.cache_creation_input_tokens || 0;
-        out.push(rec({ cli: 'cmdc', model: j.message?.model || j.model || '?', t: Date.parse(j.timestamp || j.message?.timestamp || 0),
-          in: Math.max(0, rawIn - cr - cw), out: u.outputTokens || u.output_tokens || 0,
-          cr, cw, cost: null, billing: 'plan' }));
+        const outTk = u.outputTokens || u.output_tokens || 0;
+        // cmdc 的 inputTokens 已含 cacheRead/cw，要减掉；claude 的 input_tokens 本就不含
+        const inTk = opt.inputIncludesCache ? Math.max(0, rawIn - cr - cw) : rawIn;
+        if (!(inTk + outTk + cr + cw)) continue;
+        // 重试会复用 message.id，必须带 requestId 区分；都没有时退 uuid（副本也保留 uuid）
+        // cmdc 的 id 在顶层且实测无重复行，去重对它来说是安全的空操作
+        const mid = msg.id || j.id, rid = j.requestId || j.request_id;
+        const key = mid ? (rid ? `${mid}:${rid}` : `message:${mid}`) : `uuid:${j.uuid || f}`;
+        const t = Date.parse(j.timestamp || msg.timestamp || 0);
+        const prev = best.get(key);
+        if (prev) {
+          prev.in = Math.max(prev.in, inTk); prev.out = Math.max(prev.out, outTk);
+          prev.cr = Math.max(prev.cr, cr); prev.cw = Math.max(prev.cw, cw);
+        } else {
+          best.set(key, rec({ cli, model, t, in: inTk, out: outTk, cr, cw, cost: null, billing: opt.billing }));
+        }
       } catch {}
     }
-  return out;
+  }
+  return [...best.values()];
+}
+function scanCmdc() {
+  // costUsd 是 CLI 本地 estimateSessionCostUsd，不是账单，忽略
+  return scanClaudeLike(`${H}/.commandcode/projects`, 'cmdc', { inputIncludesCache: true, billing: 'plan' });
 }
 
+// ---- Codex 用量谱系（移植自 TokenBar 的 CodexLineage）----
+// 四分量累计快照 {i,ca,o,r}：ca 是 i 的子集、r 是 o 的子集，累计标量 = i+o。
+// 规则（全部有实测依据）：
+// 1. 峰值闸门：累计不超过水位线的快照不计费——重发行和 fork 重放的父会话历史都拦在这
+// 2. min(last, 累计增量)：last_token_usage 才是真实增量，但旧版会虚报约 2x，超了就退回分量差
+// 3. 继承快照：last==0 且累计>0 是 fork/抄写写的基线行，抬水位不计费
+// 4. 计数重启：累计回落时只有 last==新累计才算真重启（压缩/续跑），重置水位
+// 5. 陈旧回退：其他回落是乱序/重放行，跳过不动状态
+const vTotal = v => v.i + v.o;
+const vMax = (a, b) => ({ i: Math.max(a.i, b.i), ca: Math.max(a.ca, b.ca), o: Math.max(a.o, b.o), r: Math.max(a.r, b.r) });
+const vSub = (a, b) => ({ i: a.i - b.i, ca: a.ca - b.ca, o: a.o - b.o, r: a.r - b.r });
+const vClamp = v => {
+  const i = Math.max(0, v.i), o = Math.max(0, v.o);
+  return { i, ca: Math.min(Math.max(0, v.ca), i), o, r: Math.min(Math.max(0, v.r), o) };
+};
+const vBounded = (v, cap) => {
+  if (vTotal(v) <= cap) return v;
+  const d = { ...v };
+  let ex = vTotal(v) - cap;
+  const i = Math.min(ex, d.i); d.i -= i; d.ca = Math.min(d.ca, d.i); ex -= i;
+  if (ex > 0) { const o = Math.min(ex, d.o); d.o -= o; d.r = Math.min(d.r, d.o); }
+  return d;
+};
+const vZero = { i: 0, ca: 0, o: 0, r: 0 };
+function usageVec(u) {
+  if (!u || typeof u !== 'object') return null;
+  if (u.input_tokens != null || u.output_tokens != null) {
+    return { i: u.input_tokens || 0, ca: Math.max(u.cached_input_tokens || 0, u.cache_read_input_tokens || 0),
+             o: u.output_tokens || 0, r: u.reasoning_output_tokens || 0 };
+  }
+  if (u.total_tokens != null) return { i: u.total_tokens || 0, ca: 0, o: 0, r: 0 };
+  return null;
+}
+function codexAdvance(st, t, l) {
+  if (!(vTotal(t) > 0)) return null;
+  st.maxTotal = vMax(st.maxTotal, t);
+  if (!l || !(vTotal(l) > 0)) { // 规则3：只抬水位
+    st.peak = vMax(st.peak, t); st.peakTotal = Math.max(st.peakTotal, vTotal(t));
+    st.prevTotal = vTotal(t); return null;
+  }
+  if (st.prevTotal != null && vTotal(t) < st.prevTotal) {
+    if (vTotal(l) === vTotal(t)) { st.peak = { ...vZero }; st.peakTotal = 0; } // 规则4：真重启
+    else return null; // 规则5：陈旧写
+  }
+  st.prevTotal = vTotal(t);
+  if (vTotal(t) > st.peakTotal) {
+    const adv = vTotal(t) - st.peakTotal;
+    const d = vClamp(vTotal(l) <= adv ? l : vBounded(vSub(t, st.peak), adv)); // 规则2
+    st.peakTotal = vTotal(t); st.peak = vMax(st.peak, t);
+    return vTotal(d) > 0 ? d : null;
+  }
+  st.peak = vMax(st.peak, t); // 规则1
+  return null;
+}
+function codexRolloutFiles() {
+  const best = new Map();
+  for (const [idx, root] of [`${H}/.codex/sessions`, `${H}/.codex/archived_sessions`].entries()) {
+    for (const f of jsonlFiles(root)) {
+      const name = path.basename(f);
+      if (!name.startsWith('rollout-')) continue;
+      const st = fs.statSync(f);
+      const cur = best.get(name);
+      // 同名文件 sessions↔archived 迁移后留两份，取较新/较大/活跃目录的那份
+      if (!cur || st.mtimeMs > cur.mtime || (st.mtimeMs === cur.mtime && (st.size > cur.size || (st.size === cur.size && idx === 0))))
+        best.set(name, { path: f, mtime: st.mtimeMs, size: st.size });
+    }
+  }
+  return [...best.entries()].sort((a, b) => a[0] < b[0] ? -1 : 1).map(e => e[1].path);
+}
+function codexProbeMeta(f) {
+  // session_meta 一定在文件头部，只读到为止，不碰文件主体
+  const fd = fs.openSync(f, 'r');
+  try {
+    const buf = Buffer.alloc(256 << 10);
+    const n = fs.readSync(fd, buf, 0, buf.length, 0);
+    for (const line of buf.subarray(0, n).toString('utf8').split('\n')) {
+      if (!line.includes('session_meta')) continue;
+      try {
+        const j = JSON.parse(line);
+        if (j.type === 'session_meta' && j.payload) return codexSessionMeta(j.payload);
+      } catch {}
+    }
+  } catch {} finally { try { fs.closeSync(fd); } catch {} }
+  return null;
+}
+function codexSessionMeta(p) {
+  const src = (p.source && typeof p.source === 'object') ? p.source : null;
+  const spawn = src?.subagent?.thread_spawn;
+  const ts = p.thread_source;
+  return {
+    ownId: p.id || p.session_id || '',
+    forkedFromId: p.forked_from_id || spawn?.parent_thread_id || null,
+    isSubagent: !!src?.subagent || ts === 'subagent' || ts === 'guardian_review',
+  };
+}
 function scanCodex() {
-  // 同一轮 token_count 会连写约 3 次，last_token_usage 不是可加增量。
-  // total_token_usage 才是会话累计；只取它变大时的差值。input 已含 cached。
   const out = [];
-  for (const f of jsonlFiles(`${H}/.codex/sessions`)) {
-    let model = '?';
-    let prev = null;
+  const sessionFinal = new Map(); // sessionId -> 该会话历史最大累计，fork 用它做基线
+  for (const f of codexRolloutFiles()) {
+    const meta = codexProbeMeta(f);
+    const st = {
+      model: '', sawMeta: false, sessionId: '', isSubagent: false,
+      peak: { ...vZero }, peakTotal: 0, prevTotal: null, maxTotal: { ...vZero },
+    };
+    // fork 从父会话历史最大水位起步：重放段全在水线下，不计费；
+    // 子代理线程有自己的独立计数，不能用父水位（否则整个文件被清零）
+    const parentFinal = meta && !meta.isSubagent && meta.forkedFromId && sessionFinal.get(meta.forkedFromId);
+    if (parentFinal && vTotal(parentFinal) > 0) {
+      st.peak = parentFinal; st.peakTotal = vTotal(parentFinal); st.maxTotal = parentFinal;
+    }
     for (const line of fs.readFileSync(f, 'utf8').split('\n')) {
+      if (!line.includes('token_count') && !line.includes('turn_context') && !line.includes('session_meta')) continue;
       try {
         const j = JSON.parse(line);
         const p = j.payload || {};
-        if ((j.type === 'turn_context' || p.type === 'turn_context' || j.type === 'session_meta' || p.type === 'session_meta') && p.model) model = p.model;
-        const tot = p.type === 'token_count' ? p.info?.total_token_usage : null;
-        if (!tot) continue;
-        const tin = tot.input_tokens || 0, tout = tot.output_tokens || 0, tcr = tot.cached_input_tokens || 0;
-        let dIn, dOut, dCr;
-        if (!prev || tin < prev.tin) { dIn = tin; dOut = tout; dCr = tcr; }
-        else { dIn = tin - prev.tin; dOut = tout - prev.tout; dCr = tcr - prev.tcr; }
-        prev = { tin, tout, tcr };
-        if (dIn <= 0 && dOut <= 0) continue;
-        const cr = Math.max(0, Math.min(dCr, dIn));
+        if (j.type === 'session_meta') {
+          if (st.sawMeta) continue; // fork 会把祖先的 meta 抄在后面，只认第一个
+          st.sawMeta = true;
+          const m = codexSessionMeta(p); st.sessionId = m.ownId; st.isSubagent = m.isSubagent;
+          continue;
+        }
+        if (j.type === 'turn_context') { if (p.model) st.model = p.model; continue; }
+        if (p.type !== 'token_count' || !p.info) continue;
+        let t = usageVec(p.info.total_token_usage);
+        const l = usageVec(p.info.last_token_usage);
+        if (!t && l && vTotal(l) > 0) {
+          // 没有累计行的旧写：用当前峰值+last 合成
+          const pk = st.peak; t = { i: pk.i + l.i, ca: pk.ca + l.ca, o: pk.o + l.o, r: pk.r + l.r };
+        }
+        if (!t) continue;
+        const d = codexAdvance(st, t, l);
+        if (!d) continue;
+        const model = p.model || p.info.model || p.info.model_name || st.model || 'unknown';
         out.push(rec({ cli: 'codex', model, t: Date.parse(j.timestamp || 0),
-          in: Math.max(0, dIn - cr), out: Math.max(0, dOut), cr, billing: 'plan' }));
+          in: Math.max(0, d.i - d.ca), out: d.o, cr: d.ca, billing: 'plan' }));
       } catch {}
+    }
+    if (st.sessionId) {
+      const cur = sessionFinal.get(st.sessionId);
+      sessionFinal.set(st.sessionId, cur ? vMax(cur, st.maxTotal) : st.maxTotal);
     }
   }
   return out;
 }
 
 function scanClaude() {
-  const out = [];
-  for (const f of jsonlFiles(`${H}/.claude/projects`))
-    for (const line of fs.readFileSync(f, 'utf8').split('\n')) {
-      if (!line.includes('"usage"')) continue;
-      try {
-        const j = JSON.parse(line);
-        const u = j.message?.usage; if (!u) continue;
-        out.push(rec({ cli: 'claude', model: j.message?.model || '?', t: Date.parse(j.timestamp || 0),
-          in: u.input_tokens || 0, out: u.output_tokens || 0,
-          cr: u.cache_read_input_tokens || 0, cw: u.cache_creation_input_tokens || 0, billing: 'list' }));
-      } catch {}
-    }
-  return out;
+  return scanClaudeLike(`${H}/.claude/projects`, 'claude', { inputIncludesCache: false, billing: 'list' });
 }
 
 function scanOpencode() {
@@ -204,16 +352,34 @@ function scanDevin() {
   try {
     const models = {};
     for (const s of db.prepare('select id, model from sessions').all()) models[s.id] = s.model;
-    for (const n of db.prepare("select session_id, chat_message, created_at from message_nodes where instr(chat_message,'input_tokens')>0").all()) {
+    // message_nodes 是 DAG 不是日志：每回合把整条对话链重新物化，同一条消息存 2~7 份。
+    // request_id 标识底层 API 调用，副本共用；message_id 是兜底。按 (session, id) 去重。
+    // 实测本机朴素求和虚高 2.39x（600.8M → 251.7M）。
+    const seen = new Set();
+    for (const n of db.prepare('select session_id, chat_message, created_at from message_nodes').all()) {
       try {
         const j = JSON.parse(n.chat_message);
-        const m = j.metadata?.metrics; if (!m?.input_tokens) continue;
+        if ((j.role || 'assistant') !== 'assistant') continue;
+        const md = j.metadata;
+        const m = md?.metrics;
+        let inTk = m?.input_tokens || 0, outTk = m?.output_tokens || 0,
+            crTk = m?.cache_read_tokens || 0, cwTk = m?.cache_creation_tokens || 0;
+        // 无 metrics 块的行可能只有 num_tokens，算 output 而不是丢弃
+        if (!(inTk + outTk + crTk + cwTk)) {
+          if (md?.num_tokens > 0) outTk = md.num_tokens; else continue;
+        }
+        const dedupId = md?.request_id || j.message_id;
+        if (dedupId) { const k = n.session_id + '' + dedupId; if (seen.has(k)) continue; seen.add(k); }
+        // generation_model 是这条消息实际由谁生成；sessions.model 是会话当前设置，
+        // 中途换模型会追溯改写历史（本机实测换过模型的会话全被标错），没设过的是空串。
+        // swe-2-high/max 是同一模型的思考强度档，合并成 swe-2。
+        const served = md?.generation_model || models[n.session_id] || 'unknown';
+        const model = served === 'adaptive' ? 'unknown' : served.toLowerCase().startsWith('swe-2-') ? 'swe-2' : served;
         // 行上的 created_at 会在会话重写时被刷成同一秒，小时图会挤成一根。生成时间在 metadata 里。
-        const gen = Date.parse(j.metadata?.started_generation_at || j.metadata?.created_at || '');
+        const gen = Date.parse(md?.started_generation_at || md?.created_at || '');
         const t = Number.isFinite(gen) ? gen : (typeof n.created_at === 'number' ? n.created_at * 1000 : Date.parse(n.created_at || 0));
-        out.push(rec({ cli: 'devin', model: models[n.session_id] || 'swe-2', t,
-          in: m.input_tokens || 0, out: m.output_tokens || 0,
-          cr: m.cache_read_tokens || 0, cw: m.cache_creation_tokens || 0, billing: 'plan' }));
+        out.push(rec({ cli: 'devin', model, t,
+          in: inTk, out: outTk, cr: crTk, cw: cwTk, billing: 'plan' }));
       } catch {}
     }
   } finally { closeDb(db); }
