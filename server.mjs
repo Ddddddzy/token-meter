@@ -1,16 +1,19 @@
 ﻿// token-meter — 本地 agent token 用量汇总
-// 零依赖: Node >=22.5 (node:sqlite), 浏览器 UI 内嵌
+// 零依赖: Node >=22.5 (node:sqlite), 仅托盘小窗与本地 API
 import { DatabaseSync } from 'node:sqlite';
 import { Worker } from 'node:worker_threads';
 import http from 'node:http';
 import os from 'node:os';
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const H = os.homedir();
 const MACHINE = os.hostname();
-const PORT = 3080;
-const UI_FILE = path.join(path.dirname(process.argv[1]), 'ui-settings.json');
+const PORT = Number(process.env.TOKEN_METER_PORT) || 3080;
+const DIR = path.dirname(fileURLToPath(import.meta.url));
+const CODEX_HOME = process.env.CODEX_HOME || path.join(H, '.codex');
+const UI_FILE = path.join(DIR, 'ui-settings.json');
 function readUi() {
   const ui = { scale: 1, glass: 0.8 };
   try { Object.assign(ui, JSON.parse(fs.readFileSync(UI_FILE, 'utf8'))); } catch {}
@@ -22,7 +25,7 @@ function sourcePaths() {
   const app = process.env.APPDATA || '';
   return [
     { name: 'Command Code', models: 'deepseek-v4-flash、v4.1-flash', path: path.join(H, '.commandcode', 'projects') },
-    { name: 'Codex', models: 'gpt-5.5、gpt-5.4', path: path.join(H, '.codex', 'sessions') },
+    { name: 'Codex', models: 'CLI / Desktop · 含归档、fork 和当前会话', path: CODEX_HOME },
     { name: 'Devin', models: 'swe-2-high', path: path.join(app, 'devin', 'cli', 'sessions.db') },
     { name: 'opencode', models: 'deepseek-v4-pro、step-5、mimo', path: path.join(H, '.local', 'share', 'opencode', 'opencode.db') },
     { name: 'Cursor', models: 'grok、composer、gpt、kimi', path: path.join(app, 'Cursor', 'User', 'globalStorage', 'state.vscdb') },
@@ -47,6 +50,11 @@ const LIST = {
   'gpt-5.6-luna': [0.20, 0.02, 1.20],
   'gpt-5.5': [5, 0.50, 30],
   'gpt-5.4': [2.5, 0.25, 15],
+  // OpenAI 官方模型页，2026-10-06；顺序 [输入未命中, 缓存读, 输出, 缓存写]
+  'gpt-6.1-sol': [2, 0.10, 10, 2.5],
+  'gpt-6-sol': [2, 0.20, 10, 2.5],
+  'gpt-6-astra': [10, 1, 50, 12.5],
+  'gpt-6-luna': [0.10, 0.01, 0.50, 0.125],
   'grok-4.7': [2, 0.50, 6],
   'grok-4.6': [2, 0.50, 6],
   'grok-4.5': [2, 0.50, 6],
@@ -70,7 +78,7 @@ const FAST = {
 // LiteLLM 价目表快照（TokenBar model_prices.json，{i,o,r,w} = $/1M 输入/输出/缓存读/缓存写）。
 // 只做精确匹配——子串匹配会把 gpt-5 错接到 gpt-5.6-sol 上按错代次计价（TokenBar 踩过）。
 const PRICES = (() => {
-  try { return JSON.parse(fs.readFileSync(path.join(path.dirname(process.argv[1]), 'model_prices.json'), 'utf8')); } catch { return {}; }
+  try { return JSON.parse(fs.readFileSync(path.join(DIR, 'model_prices.json'), 'utf8')); } catch { return {}; }
 })();
 function litellmRate(m) {
   const bare = m.includes('/') ? m.slice(m.lastIndexOf('/') + 1) : m;
@@ -93,7 +101,10 @@ function rateFor(model) {
   return fast || hit;
 }
 function listUsd(r, rate) {
-  return (r.in * rate[0] + r.cr * rate[1] + (r.cw || 0) * (rate[3] ?? rate[0]) + r.out * rate[2]) / 1e6;
+  const long = /^gpt-(6|5\.6)/.test(r.model) && r.in + r.cr + r.cw > 272000;
+  const fast = r.serviceTier === 'priority' || r.serviceTier === 'fast';
+  const factor = fast && /^gpt-/.test(r.model) ? 2 : 1;
+  return ((r.in * rate[0] + r.cr * rate[1] + (r.cw || 0) * (rate[3] ?? rate[0])) * (long ? 2 : 1) + r.out * rate[2] * (long ? 1.5 : 1)) * factor / 1e6;
 }
 
 // ---------- 扫描器 ----------
@@ -110,11 +121,14 @@ const rec = (o) => ({ machine: MACHINE, in: 0, out: 0, cr: 0, cw: 0, cost: null,
 // 正在运行的 app 的 SQLite 不能直接读（WAL 读锁可能让写入方 BUSY 崩溃），
 // 复制 db+wal+shm 到临时目录再打开副本
 function openDbCopy(p) {
+  if (!fs.existsSync(p)) return null;
   const tmp = path.join(os.tmpdir(), `tm-${path.basename(p)}-${process.pid}-${Date.now()}`);
   for (const s of ['', '-wal', '-shm']) {
     try { fs.copyFileSync(p + s, tmp + s); } catch {}
   }
-  const db = new DatabaseSync(tmp, { readOnly: true });
+  let db;
+  try { db = new DatabaseSync(tmp, { readOnly: true }); }
+  catch (e) { for (const s of ['', '-wal', '-shm']) try { fs.unlinkSync(tmp + s); } catch {} throw e; }
   db._tmp = tmp;
   return db;
 }
@@ -203,7 +217,7 @@ function usageVec(u) {
   if (!u || typeof u !== 'object') return null;
   if (u.input_tokens != null || u.output_tokens != null) {
     return { i: u.input_tokens || 0, ca: Math.max(u.cached_input_tokens || 0, u.cache_read_input_tokens || 0),
-             o: u.output_tokens || 0, r: u.reasoning_output_tokens || 0 };
+             o: u.output_tokens || 0, r: u.reasoning_output_tokens || 0, cw:u.cache_write_input_tokens || 0 };
   }
   if (u.total_tokens != null) return { i: u.total_tokens || 0, ca: 0, o: 0, r: 0 };
   return null;
@@ -231,7 +245,7 @@ function codexAdvance(st, t, l) {
 }
 function codexRolloutFiles() {
   const best = new Map();
-  for (const [idx, root] of [`${H}/.codex/sessions`, `${H}/.codex/archived_sessions`].entries()) {
+  for (const [idx, root] of [path.join(CODEX_HOME,'sessions'),path.join(CODEX_HOME,'archived_sessions')].entries()) {
     for (const f of jsonlFiles(root)) {
       const name = path.basename(f);
       if (!name.startsWith('rollout-')) continue;
@@ -270,54 +284,104 @@ function codexSessionMeta(p) {
     isSubagent: !!src?.subagent || ts === 'subagent' || ts === 'guardian_review',
   };
 }
-function scanCodex() {
-  const out = [];
-  const sessionFinal = new Map(); // sessionId -> 该会话历史最大累计，fork 用它做基线
-  for (const f of codexRolloutFiles()) {
-    const meta = codexProbeMeta(f);
-    const st = {
-      model: '', sawMeta: false, sessionId: '', isSubagent: false,
-      peak: { ...vZero }, peakTotal: 0, prevTotal: null, maxTotal: { ...vZero },
-    };
-    // fork 从父会话历史最大水位起步：重放段全在水线下，不计费；
-    // 子代理线程有自己的独立计数，不能用父水位（否则整个文件被清零）
-    const parentFinal = meta && !meta.isSubagent && meta.forkedFromId && sessionFinal.get(meta.forkedFromId);
-    if (parentFinal && vTotal(parentFinal) > 0) {
-      st.peak = parentFinal; st.peakTotal = vTotal(parentFinal); st.maxTotal = parentFinal;
+// 仅缓存用量/模型/谱系事件，文件未变时不重复读取整个对话。
+const codexFilesCache = new Map();
+function codexEvents(f) {
+  const stat = fs.statSync(f), prev = codexFilesCache.get(f);
+  if (prev && prev.size === stat.size && prev.mtime === stat.mtimeMs) return prev.events;
+  const events = [];
+  for (const line of fs.readFileSync(f, 'utf8').split('\n')) {
+    if (!/token_usage_record|token_count|turn_context|session_meta|model\/rerouted/.test(line)) continue;
+    try {
+      const j = JSON.parse(line), p = j.payload || {};
+      if (j.type === 'session_meta') {
+        if (!events.some(e => e.type === 'session_meta')) events.push({type:j.type, timestamp:j.timestamp, ordinal:j.ordinal, payload:p});
+      } else if (j.type === 'turn_context') {
+        events.push({...j, payload:{model:p.model, service_tier:p.service_tier}});
+      } else if (j.type === 'token_usage_record' || p.type === 'token_count' || p.type === 'model/rerouted') events.push(j);
+    } catch {} // 正在写入的末行稍后重扫
+  }
+  codexFilesCache.set(f, {size:stat.size, mtime:stat.mtimeMs, events});
+  return events;
+}
+const vecKey = v => v ? [v.i,v.ca,v.o,v.r,v.cw || 0].join(':') : '';
+function scanCodex(files = codexRolloutFiles()) {
+  const out = [], exact = new Map(), visited = new Set();
+  const sessions = new Map();
+  const items = files.map(f => {
+    const events = codexEvents(f);
+    const metaEvent = events.find(e => e.type === 'session_meta');
+    const meta = metaEvent ? {...codexSessionMeta(metaEvent.payload),
+      forkOrdinal:metaEvent.payload.forked_from_ordinal_exclusive ?? metaEvent.payload.history_base?.end_ordinal_exclusive,
+      timestamp:metaEvent.timestamp} : null;
+    const item = {f, events, meta};
+    if (meta?.ownId) sessions.set(meta.ownId, item);
+    return item;
+  });
+  // 父线程只取 fork 点前的累计，不能取后来继续增长的终值。
+  function forkBaseline(item, seen = new Set()) {
+    const m = item.meta;
+    if (!m || m.isSubagent || !m.forkedFromId || seen.has(m.ownId)) return null;
+    seen.add(m.ownId);
+    const parent = sessions.get(m.forkedFromId);
+    if (!parent) return null;
+    let base = forkBaseline(parent, seen);
+    for (const e of parent.events) {
+      if (m.forkOrdinal != null && e.ordinal != null ? e.ordinal >= m.forkOrdinal :
+          Date.parse(e.timestamp) >= Date.parse(m.timestamp)) continue;
+      const total = usageVec(e.payload?.thread_token_usage || e.payload?.info?.total_token_usage);
+      if (total) base = total;
     }
-    for (const line of fs.readFileSync(f, 'utf8').split('\n')) {
-      if (!line.includes('token_count') && !line.includes('turn_context') && !line.includes('session_meta')) continue;
-      try {
-        const j = JSON.parse(line);
-        const p = j.payload || {};
-        if (j.type === 'session_meta') {
-          if (st.sawMeta) continue; // fork 会把祖先的 meta 抄在后面，只认第一个
-          st.sawMeta = true;
-          const m = codexSessionMeta(p); st.sessionId = m.ownId; st.isSubagent = m.isSubagent;
-          continue;
-        }
-        if (j.type === 'turn_context') { if (p.model) st.model = p.model; continue; }
-        if (p.type !== 'token_count' || !p.info) continue;
-        let t = usageVec(p.info.total_token_usage);
-        const l = usageVec(p.info.last_token_usage);
-        if (!t && l && vTotal(l) > 0) {
-          // 没有累计行的旧写：用当前峰值+last 合成
-          const pk = st.peak; t = { i: pk.i + l.i, ca: pk.ca + l.ca, o: pk.o + l.o, r: pk.r + l.r };
-        }
-        if (!t) continue;
-        const d = codexAdvance(st, t, l);
-        if (!d) continue;
-        const model = p.model || p.info.model || p.info.model_name || st.model || 'unknown';
-        out.push(rec({ cli: 'codex', model, t: Date.parse(j.timestamp || 0),
-          in: Math.max(0, d.i - d.ca), out: d.o, cr: d.ca, billing: 'plan' }));
-      } catch {}
-    }
-    if (st.sessionId) {
-      const cur = sessionFinal.get(st.sessionId);
-      sessionFinal.set(st.sessionId, cur ? vMax(cur, st.maxTotal) : st.maxTotal);
+    return base;
+  }
+  function processFile(item) {
+    if (visited.has(item.f)) return;
+    visited.add(item.f);
+    const parent = item.meta?.forkedFromId && sessions.get(item.meta.forkedFromId);
+    if (parent) processFile(parent);
+    const base = forkBaseline(item);
+    const st = { model:'', serviceTier:null, peak:{...vZero,...base}, peakTotal:base ? vTotal(base) : 0,
+      prevTotal:null, maxTotal:{...vZero} };
+    const snapshots = new Set(item.events.filter(e => e.type === 'token_usage_record')
+      .map(e => vecKey(usageVec(e.payload.thread_token_usage))).filter(Boolean));
+    for (const j of item.events) {
+      const p = j.payload || {};
+      if (j.type === 'turn_context') { st.model = p.model || st.model; st.serviceTier = p.service_tier || null; continue; }
+      if (p.type === 'model/rerouted') { st.model = p.to_model || p.toModel || st.model; continue; }
+      const modern = j.type === 'token_usage_record';
+      if (!modern && p.type !== 'token_count') continue;
+      const total = usageVec(modern ? p.thread_token_usage : p.info?.total_token_usage);
+      const last = usageVec(modern ? p.usage : p.info?.last_token_usage);
+      const model = p.model || p.info?.model || p.info?.model_name || st.model || 'unknown';
+      const t = Date.parse(j.timestamp);
+      if (modern && last && vTotal(last) > 0) {
+        if (total) codexAdvance(st, total, last);
+        const inherited = item.meta?.ownId && p.thread_id && p.thread_id !== item.meta.ownId;
+        if (inherited) continue;
+        const key = p.response_id || [p.thread_id || item.meta?.ownId || item.f,p.turn_id,j.ordinal ?? j.timestamp,vecKey(last)].join(':');
+        const r = rec({cli:'codex',model,t,sessionId:p.thread_id || item.meta?.ownId,
+          responseId:p.response_id || null, in:Math.max(0,last.i-last.ca-(last.cw || 0)),
+          cr:last.ca,cw:last.cw || 0,out:last.o,reasoning:last.r,serviceTier:p.service_tier || st.serviceTier,billing:'plan'});
+        const prev = exact.get(key);
+        if (!prev || prev.in+prev.cr+prev.cw+prev.out < r.in+r.cr+r.cw+r.out) exact.set(key,r);
+        continue;
+      }
+      let cumulative = total;
+      if (!cumulative && last && vTotal(last) > 0) {
+        cumulative = {i:st.peak.i+last.i,ca:st.peak.ca+last.ca,o:st.peak.o+last.o,r:st.peak.r+last.r};
+      }
+      if (!cumulative) continue;
+      const d = codexAdvance(st,cumulative,last);
+      // 新/旧事件描述同一次请求，只保留 response_id 的精确记录。
+      if (!d || snapshots.has(vecKey(cumulative))) continue;
+      out.push(rec({cli:'codex',model,t,sessionId:item.meta?.ownId,
+        in:Math.max(0,d.i-d.ca),cr:d.ca,out:d.o,reasoning:d.r,serviceTier:st.serviceTier,billing:'plan'}));
     }
   }
-  return out;
+  for (const item of items) processFile(item);
+  const active = new Set(files);
+  for (const f of codexFilesCache.keys()) if (!active.has(f)) codexFilesCache.delete(f);
+  return out.concat([...exact.values()]);
 }
 
 function scanClaude() {
@@ -329,6 +393,7 @@ function scanOpencode() {
   // 长期会话会把历史用量都算到创建日；message.data 里有逐条 tokens/cost/modelID
   const out = [];
   const db = openDbCopy(`${H}/.local/share/opencode/opencode.db`);
+  if (!db) return out;
   try {
     for (const m of db.prepare("select time_created, data from message where instr(data,'\"tokens\"')>0").all()) {
       try {
@@ -349,6 +414,7 @@ function scanOpencode() {
 function scanDevin() {
   const out = [];
   const db = openDbCopy(`${process.env.APPDATA}/devin/cli/sessions.db`);
+  if (!db) return out;
   try {
     const models = {};
     for (const s of db.prepare('select id, model from sessions').all()) models[s.id] = s.model;
@@ -483,15 +549,24 @@ let cursorWorker = null;
 function startCursorScan() {
   if (cursorWorker) return;
   cursorWorker = new Worker(CURSOR_WORKER, { eval: true, workerData: { machine: MACHINE } });
+  const worker = cursorWorker;
+  cache.sources.cursor = {...cache.sources.cursor,pending:true};
   const kill = setTimeout(() => { try { cursorWorker?.terminate(); } catch {} }, 300000);
   cursorWorker.on('message', (recs) => {
     cache.records = cache.records.filter(r => r.cli !== 'cursor').concat(recs);
-    cache.sources.cursor = { ...cache.sources.cursor, estRecords: recs.length };
+    cache.sources.cursor = { ...cache.sources.cursor, estRecords: recs.length,pending:false };
+    cache.cursorAt = Date.now();
     cursorWorker = null; clearTimeout(kill);
   });
   cursorWorker.on('error', (e) => {
     cache.errs.push('cursor: ' + e.message);
+    cache.sources.cursor.pending = false;
     cursorWorker = null; clearTimeout(kill);
+  });
+  worker.on('exit', code => {
+    if (cursorWorker !== worker) return;
+    clearTimeout(kill); cursorWorker = null; cache.sources.cursor.pending = false;
+    if (code) cache.errs.push('cursor: 后台扫描未完成，请重新扫描');
   });
 }
 
@@ -536,10 +611,15 @@ function aggregate(records, rangeMs) {
   if (rangeMs === 864e5) {
     const d0 = new Date(); d0.setHours(0, 0, 0, 0);
     from = d0.getTime();
-  } else if (rangeMs != null) from = now - rangeMs;
+  } else if (rangeMs != null) {
+    const d0 = new Date(); d0.setHours(0,0,0,0);
+    d0.setDate(d0.getDate() - Math.round(rangeMs / 864e5) + 1);
+    from = d0.getTime();
+  }
   const recs = records.filter(r => r.t && (from == null || r.t >= from) && r.t <= now);
-  const by = { cli: {}, model: {}, machine: {} };
+  const by = { cli: {}, model: {}, machine: {}, cm: {} };
   let tokens = 0, cashAll = 0, listAll = 0, estAll = 0, unpriced = new Set();
+  let noneTk = 0, estTk = 0;
   for (const r of recs) {
     const tk = r.in + r.out + r.cr + r.cw;
     const hit = rateFor(r.model);
@@ -555,6 +635,9 @@ function aggregate(records, rangeMs) {
       const b = by[dim][k] ||= { tokens: 0, usd: 0, bills: new Set(), clis: new Set() };
       b.tokens += tk; b.usd += usd; b.bills.add(bill); b.clis.add(r.cli);
     }
+    const mb = (by.cm[r.cli] ||= {})[r.model] ||= { tokens: 0, usd: 0, bills: new Set(), clis: new Set() };
+    mb.tokens += tk; mb.usd += usd; mb.bills.add(bill); mb.clis.add(r.cli);
+    if (bill === 'none') noneTk += tk; else if (bill === 'estimate') estTk += tk;
     tokens += tk;
     if (bill === 'gateway') cashAll += usd;
     else if (bill === 'list') listAll += usd;
@@ -593,7 +676,7 @@ function aggregate(records, rangeMs) {
     const cur = new Date(new Date(min).getFullYear(), new Date(min).getMonth(), 1);
     while (cur.getTime() <= now) {
       const s = cur.getTime();
-      const label = `${cur.getMonth() + 1}月`;
+      const label = `${cur.getFullYear()}/${cur.getMonth() + 1}`;
       cur.setMonth(cur.getMonth() + 1);
       days.push({ d: label, t: tk(s, cur.getTime()) });
     }
@@ -603,25 +686,48 @@ function aggregate(records, rangeMs) {
   const list = Math.round(listAll * 100) / 100;
   const est = Math.round(estAll * 100) / 100;
   const worth = Math.round((cash + list + est) * 100) / 100;
+  const byCliModel = {};
+  for (const [cli, models] of Object.entries(by.cm)) byCliModel[cli] = ser(models);
+  // 近 14 天按 CLI 堆叠：固定窗口，不随所选时间范围变化（/panel 的趋势图用）。
+  // 小窗也使用同一范围/粒度，柱子合计必须等于上方总量。
+  const stacks = days.map(d => ({label:d.d,parts:{}}));
+  const firstMonth = recs.reduce((min,r) => Math.min(min,r.t),now);
+  const month0 = new Date(firstMonth);
+  for (const r of recs) {
+    const d = new Date(r.t);
+    const idx = rangeMs === 864e5 ? d.getHours() : rangeMs != null ?
+      Math.round((new Date(d.getFullYear(),d.getMonth(),d.getDate()).getTime() - from)/864e5) :
+      (d.getFullYear()-month0.getFullYear())*12+d.getMonth()-month0.getMonth();
+    if (stacks[idx]) stacks[idx].parts[r.cli] = (stacks[idx].parts[r.cli] || 0)+r.in+r.out+r.cr+r.cw;
+  }
+  const codexRecs = recs.filter(r => r.cli === 'codex');
+  const codex = { tokens:codexRecs.reduce((n,r)=>n+r.in+r.cr+r.cw+r.out,0),
+    input:codexRecs.reduce((n,r)=>n+r.in+r.cr+r.cw,0),cached:codexRecs.reduce((n,r)=>n+r.cr,0),
+    output:codexRecs.reduce((n,r)=>n+r.out,0),reasoning:codexRecs.reduce((n,r)=>n+(r.reasoning||0),0),
+    requests:codexRecs.length,lastAt:codexRecs.reduce((n,r)=>Math.max(n,r.t),0) };
   return {
     tokens, cost: worth, costLabel: '$' + worth.toFixed(2),
     list, cash, est,
     moneyNote: `标价 $${list.toFixed(2)} · 估算 $${est.toFixed(2)} · 网关 $${cash.toFixed(2)}`,
-    pricedPct: 0, estPct: tokens ? Math.round((estAll > 0 ? 1 : 0) * 100) : 0,
-    byCli: ser(by.cli), byModel: ser(by.model), byMachine: ser(by.machine),
-    days, chartLabel, unpriced: [...unpriced],
+    pricedPct: tokens ? Math.round((tokens - noneTk) / tokens * 100) : 0,
+    estPct: tokens ? Math.round(estTk / tokens * 100) : 0,
+    byCli: ser(by.cli), byModel: ser(by.model), byMachine: ser(by.machine), byCliModel,
+    days, stacks, chartLabel, codex, unpriced: [...unpriced],
   };
 }
 
 // ---------- HTTP ----------
 let cache = { at: 0, records: [], errs: [], sources: {}, ms: 0 };
-function refresh() {
+function refresh(force = false) {
   const s = scanAll();
-  cache = { at: Date.now(), ...s, records: cache.records.filter(r => r.cli === 'cursor').concat(s.records) };
-  startCursorScan();
+  const cursorAt = cache.cursorAt || 0;
+  cache = { at: Date.now(), ...s,cursorAt, records: cache.records.filter(r => r.cli === 'cursor').concat(s.records) };
+  if (force || Date.now()-cursorAt > 15*60000) startCursorScan();
   return cache;
 }
-if (process.argv.includes('--audit')) {
+const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+export { scanCodex, codexAdvance, usageVec, aggregate, rateFor, listUsd, scanAll };
+if (isMain && process.argv.includes('--audit')) {
   const s = scanAll();
   const cursorRecs = await new Promise((resolve, reject) => {
     const w = new Worker(CURSOR_WORKER, { eval: true, workerData: { machine: MACHINE } });
@@ -636,20 +742,30 @@ if (process.argv.includes('--audit')) {
   }, null, 2));
   process.exit(0);
 }
-refresh();
+if (isMain) refresh();
 
 let backdropJpeg = null;
 const RANGE = { day: 864e5, '7d': 7 * 864e5, '30d': 30 * 864e5, all: null };
 const RANGE_LABEL = { day: '今日', '7d': '7 天', '30d': '30 天', all: '全部' };
 
-http.createServer((req, res) => {
+if (isMain) http.createServer((req, res) => {
   const u = new URL(req.url, 'x://x');
   if (u.pathname === '/api') {
-    if (u.searchParams.get('refresh')) refresh();
+    if (u.searchParams.get('refresh') || Date.now()-cache.at > 60000) refresh(!!u.searchParams.get('refresh'));
+    else if (Date.now()-(cache.codexAt || cache.at) > 5000) {
+      try {
+        const records = scanCodex();
+        cache.records = cache.records.filter(r=>r.cli !== 'codex').concat(records);
+        cache.sources.codex = {records:records.length};
+        cache.codexAt = Date.now();
+      } catch (e) { cache.errs.push('codex: '+e.message); }
+    }
     const range = u.searchParams.get('range') || 'day';
+    if (!(range in RANGE)) { res.writeHead(400,{'content-type':'application/json'}); res.end('{"error":"invalid range"}'); return; }
     const a = aggregate(cache.records, RANGE[range]);
     res.setHeader('content-type', 'application/json; charset=utf-8');
-    res.end(JSON.stringify({ ...a, range, rangeLabel: RANGE_LABEL[range], scanMs: cache.ms, at: cache.at, errs: cache.errs, machine: MACHINE, sources: cache.sources }));
+    res.setHeader('cache-control','no-store');
+    res.end(JSON.stringify({ ...a, range, rangeLabel: RANGE_LABEL[range], scanMs: cache.ms, at: Math.max(cache.at,cache.codexAt||0), errs: cache.errs, machine: MACHINE, sources: cache.sources }));
   } else if (u.pathname === '/api/ui' && req.method === 'GET') {
     res.setHeader('content-type', 'application/json; charset=utf-8');
     res.end(JSON.stringify({ ...readUi(), paths: sourcePaths() }));
@@ -684,244 +800,17 @@ http.createServer((req, res) => {
     res.setHeader('cache-control', 'no-store');
     res.end(backdropJpeg);
   } else if (u.pathname === '/backdrop.png') {
-    const file = path.join(path.dirname(process.argv[1]), 'backdrop.png');
+    const file = path.join(DIR, 'backdrop.png');
     if (!fs.existsSync(file)) { res.statusCode = 404; res.end(); return; }
     res.setHeader('content-type', 'image/png');
     res.setHeader('cache-control', 'no-store');
     res.end(fs.readFileSync(file));
-  } else if (u.pathname === '/') {
+  } else if (u.pathname === '/panel') {
     res.setHeader('content-type', 'text/html; charset=utf-8');
-    res.end(HTML);
+    res.setHeader('cache-control','no-store');
+    res.end(fs.readFileSync(path.join(DIR, 'panel.html')));
+  } else if (u.pathname === '/') {
+    res.writeHead(410,{'content-type':'text/plain; charset=utf-8'});
+    res.end('网页版已移除。请使用 Token Meter 托盘小窗。');
   } else { res.statusCode = 404; res.end(); }
-}).listen(PORT, () => console.log(`token-meter: http://127.0.0.1:${PORT}`));
-
-const HTML = `<!doctype html><html lang=zh><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>token-meter</title>
-<style>
-:root{--fg:rgba(255,255,255,.94);--mut:rgba(255,255,255,.62);--acc:#6aa2ff;--amber:#f0c27a;--green:#7dffa8;--line:rgba(255,255,255,.16)}
-*{box-sizing:border-box;margin:0;font:13px/1.45 ui-sans-serif,system-ui,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
-html,body{min-height:100%}
-body{
-  color:var(--fg);
-  padding:28px 16px 40px;
-  background:
-    radial-gradient(900px 520px at 12% -10%, rgba(255,214,170,.85), transparent 55%),
-    radial-gradient(700px 480px at 110% 8%, rgba(186,198,214,.7), transparent 50%),
-    radial-gradient(800px 600px at 80% 120%, rgba(96,140,220,.45), transparent 55%),
-    linear-gradient(165deg, #efe6d8 0%, #d5dbe3 42%, #b7c3d4 100%);
-}
-html.embed,body.embed{height:100%;padding:0;margin:0;overflow:hidden;background:transparent}
-body.embed .backdrop{display:none}
-body.embed .sheet{
-  width:100%;height:100%;max-height:100%;margin:0;border-radius:0;
-  background:rgba(12,16,24,.2);
-  -webkit-backdrop-filter:blur(12px) saturate(1.35);
-  backdrop-filter:blur(12px) saturate(1.35);
-  box-shadow:inset 0 0 0 1px rgba(255,255,255,.28);
-}
-.backdrop{position:fixed;inset:0;z-index:0;pointer-events:none;overflow:hidden}
-.wash{position:absolute;inset:-8%;background:
-  radial-gradient(460px 300px at 28% 18%, rgba(255,176,96,.95), transparent 68%),
-  radial-gradient(420px 340px at 78% 72%, rgba(70,120,220,.72), transparent 70%),
-  repeating-linear-gradient(90deg, transparent 0 46px, rgba(255,255,255,.28) 46px 47px)}
-.sheet{
-  position:relative;z-index:1;
-  width:min(560px,100%);
-  margin:0 auto;
-  display:flex;flex-direction:column;
-  max-height:calc(100vh - 48px);
-  overflow:hidden;
-  padding:16px 16px 12px;
-  border-radius:28px;
-  background:rgba(62,66,76,.34);
-  -webkit-backdrop-filter:blur(28px) saturate(1.6);
-  backdrop-filter:blur(28px) saturate(1.6);
-  border:1px solid rgba(255,255,255,.38);
-  box-shadow:0 30px 70px rgba(40,44,58,.28), inset 0 1px 0 rgba(255,255,255,.45), inset 0 0 0 1px rgba(255,255,255,.06);
-}
-.card{
-  background:rgba(255,255,255,.10);
-  border:1px solid rgba(255,255,255,.22);
-  border-radius:18px;
-  padding:14px 16px 12px;
-  box-shadow:inset 0 1px 0 rgba(255,255,255,.28);
-}
-.top{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px}
-.lb{color:var(--mut);font-size:12px;display:flex;justify-content:space-between;align-items:center;gap:8px}
-.lb>span{white-space:nowrap}
-@media (max-width:520px){#upd{display:none}.big{font-size:28px}.cst{min-width:72px}}
-.big{font-size:34px;font-weight:600;letter-spacing:-.04em;margin:4px 0 2px;font-variant-numeric:tabular-nums;color:#fff}
-.big small{font-size:13px;font-weight:500;color:var(--mut);margin-left:6px;letter-spacing:0}
-.sub{color:var(--mut);font-size:11.5px}
-.sub b{color:#fff;font-weight:600}
-.block{padding:8px 6px 2px}
-.grow{flex:1;min-height:0;display:flex;flex-direction:column}
-#list{flex:1;min-height:0;overflow-y:auto;overscroll-behavior:contain;padding-right:4px;scrollbar-width:thin;scrollbar-color:rgba(255,255,255,.45) transparent}
-#list::-webkit-scrollbar{width:8px}
-#list::-webkit-scrollbar-thumb{background:rgba(255,255,255,.42);border-radius:99px}
-#list::-webkit-scrollbar-track{background:transparent}
-.chart{display:flex;gap:4px;align-items:flex-end;height:108px;margin:12px 2px 18px}
-.bar{flex:1;background:linear-gradient(180deg,rgba(255,255,255,.55),#5b8cff 28%,#3a6fe0);border-radius:5px 5px 2px 2px;min-height:2px;position:relative}
-.bar.today{background:linear-gradient(180deg,#fff,#8eb4ff 30%,#5b8cff)}
-.bar i{position:absolute;top:100%;left:-10px;right:-10px;text-align:center;font-size:10px;color:var(--mut);font-style:normal;margin-top:4px;white-space:nowrap}
-.seg{display:inline-flex;gap:2px;padding:3px;border-radius:14px;background:rgba(0,0,0,.16);border:1px solid rgba(255,255,255,.14);margin:4px 0 8px}
-.tab{padding:5px 12px;border-radius:11px;cursor:pointer;color:var(--mut);font-size:12px;border:0;background:transparent}
-.tab:hover{color:#fff}
-.tab.on{background:rgba(255,255,255,.22);color:#fff;box-shadow:inset 0 1px 0 rgba(255,255,255,.4)}
-.li{display:grid;grid-template-columns:minmax(0,1fr) auto auto;column-gap:12px;row-gap:2px;padding:11px 4px 9px;border-top:1px solid rgba(255,255,255,.1)}
-.li:first-child{border-top:0}
-.nm{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.src{grid-column:1;color:var(--mut);font-size:11px}
-.barc{grid-column:1;height:3px;margin-top:5px;background:rgba(255,255,255,.12);border-radius:99px;overflow:hidden}
-.fill{height:100%;border-radius:99px;background:linear-gradient(90deg,#9ec0ff,#5b8cff)}
-.fill.est{background:linear-gradient(90deg,#ffe1a8,#e8b45a)}
-.fill.np{background:rgba(255,255,255,.28)}
-.tk{grid-row:1;grid-column:2;text-align:right;font-variant-numeric:tabular-nums;font-weight:600}
-.cst{grid-row:1;grid-column:3;min-width:92px;text-align:right;font-variant-numeric:tabular-nums;color:rgba(255,255,255,.88)}
-.cst.est{color:var(--amber)}
-.warn{color:var(--amber);font-size:11.5px;margin:8px 4px 4px}
-.bottom{display:flex;flex-direction:column;align-items:center;gap:8px;padding:8px 0 4px}
-.ft{display:flex;gap:14px;align-items:center;width:100%;color:var(--mut);font-size:12px;padding:0 4px}
-.ft #scan{margin-left:auto}
-.ft button{background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.22);color:#fff;width:32px;height:32px;border-radius:50%;cursor:pointer;font-size:15px}
-.ft button:hover{background:rgba(255,255,255,.22)}
-.cfg{position:absolute;left:12px;right:12px;bottom:58px;z-index:6;max-height:calc(100% - 86px);overflow:auto;padding:14px 14px 12px;border-radius:18px;background:rgba(20,24,32,.72);border:1px solid rgba(255,255,255,.28);box-shadow:0 16px 40px rgba(0,0,0,.28);-webkit-backdrop-filter:blur(16px);backdrop-filter:blur(16px)}
-.cfg h3{font-size:14px;font-weight:600;margin-bottom:10px}
-.cfg .row{display:flex;justify-content:space-between;align-items:center;gap:12px;margin:8px 0 4px;font-size:12px;color:var(--mut)}
-.cfg .row b{color:#fff;font-variant-numeric:tabular-nums}
-.cfg input[type=range]{width:100%;accent-color:#8eb4ff}
-.cfg .srcpath{margin-top:12px;padding-top:8px;border-top:1px solid rgba(255,255,255,.12)}
-.cfg .srcpath .nm{font-size:12px}
-.cfg .srcpath .sub{word-break:break-all;user-select:text}
-.dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--green);margin-right:6px}
-</style>
-<script>if(location.search.indexOf('embed')>=0){var qs=new URLSearchParams(location.search);var zs=parseFloat(qs.get('scale'));if(zs)document.documentElement.style.zoom=zs;document.documentElement.classList.add('embed');}</script>
-<div class=backdrop><div class=wash></div></div>
-<div class=sheet>
-<div class=top>
- <div class=card>
-  <div class=lb><span id=lbTk>今日用量</span><span id=host></span></div>
-  <div class=big id=tk>—</div>
-  <div class=sub id=tkSub></div>
- </div>
- <div class=card>
-  <div class=lb><span>用量估价</span><span id=upd></span></div>
-  <div class=big id=cost>—</div>
-  <div class=sub id=pct></div>
- </div>
-</div>
-<div class=block>
- <div class=lb><span id=chartTitle>今日 · 按小时</span><span id=scanIn></span></div>
- <div class=chart id=chart></div>
-</div>
-<div class="block grow">
- <div class=seg>
-  <span class="tab on" data-d=model>按模型</span><span class=tab data-d=cli>按 CLI</span><span class=tab data-d=machine>按机器</span>
- </div>
- <div id=list></div>
- <div class=warn id=warn></div>
-</div>
-<div class=bottom>
- <div class=seg>
-  <span class="tab rng on" data-r=day>今日</span><span class="tab rng" data-r=7d>7 天</span><span class="tab rng" data-r=30d>30 天</span><span class="tab rng" data-r=all>全部</span>
- </div>
- <div class=ft>
-  <button onclick="load(1)" title="刷新">⟳</button>
-  <span><span class=dot></span><span id=sync></span></span>
-  <span id=scan></span>
-  <button id=gear type=button title="设置">⚙</button>
- </div>
-</div>
-<div id=cfg class=cfg hidden>
- <h3>设置</h3>
- <div class=row><span>窗口大小</span><b id=scaleLab>100%</b></div>
- <input id=scaleRange type=range min=0.8 max=1.4 step=0.05 value=1>
- <div class=row><span>磨砂透光度</span><b id=glassLab>80%</b></div>
- <input id=glassRange type=range min=0.15 max=0.9 step=0.05 value=0.8>
- <div id=paths></div>
-</div>
-</div>
-<script>
-let dim='model', range='day', lastJ=null;
-const fmt=n=>n>=1e9?(n/1e9).toFixed(2)+'B':n>=1e6?(n/1e6).toFixed(1)+'M':n>=1e3?(n/1e3).toFixed(1)+'K':''+n;
-const esc=s=>(''+s).replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));
-async function load(rf){
- const j=await(await fetch('/api?range='+range+(rf?'&refresh=1':''))).json(); lastJ=j;
- lbTk.textContent=j.rangeLabel+'用量';
- tk.innerHTML=fmt(j.tokens)+'<small>tokens</small>';
- cost.innerHTML=j.costLabel||('≈$'+j.cost.toFixed(2));
- tkSub.innerHTML=j.tokens.toLocaleString('en-US')+'<br>共 <b>'+j.byCli.length+'</b> 个 CLI · <b>'+j.byModel.length+'</b> 个模型';
- pct.innerHTML=j.moneyNote||'';
- upd.textContent='更新于 '+new Date(j.at).toTimeString().slice(0,8);
- host.textContent=j.machine;
- scan.textContent='扫描 '+j.scanMs+'ms';
- scanIn.textContent='扫描 '+j.scanMs+'ms';
- sync.textContent=j.machine+' · '+new Date(j.at).toLocaleTimeString();
- chartTitle.textContent=j.chartLabel||'近 14 天';
- const mx=Math.max(...j.days.map(d=>d.t),1);
- const step=Math.ceil(j.days.length/9);
- const cur=range==='day'?new Date().getHours():j.days.length-1;
- chart.innerHTML=j.days.map((d,i)=>'<div class="bar'+(i==cur?' today':'')+'" style="height:'+Math.max(2,d.t/mx*92)+'px" title="'+d.d+': '+fmt(d.t)+'"><i>'+(i%step==0?d.d:'')+'</i></div>').join('');
- const key={model:'byModel',cli:'byCli',machine:'byMachine'}[dim];
- const rows=j[key]||[];
- const m2=Math.max(...rows.map(r=>r.tokens),1);
- list.innerHTML=rows.map(r=>'<div class=li><span class=nm>'+esc(r.name)+'</span><span class=tk>'+fmt(r.tokens)+'</span><span class="cst'+(r.est?' est':'')+'">'+(r.bill?esc(r.bill):(r.noprice?'无公开价':'$'+r.cost.toFixed(2)))+'</span><span class=src>'+esc(r.cli)+'</span><div class=barc><div class="fill'+(r.noprice?' np':r.est?' est':'')+'" style="width:'+Math.max(4,r.tokens/m2*100)+'%"></div></div></div>').join('')||'<div class=sub style="padding:24px;text-align:center">该范围无数据</div>';
- warn.textContent=j.unpriced.length?j.unpriced.length+' 个模型无公开价未计入费用':'';
- const notes=[];
- for(const [k,s]of Object.entries(j.sources||{}))
-  if(s.error)notes.push(k+': '+s.error);
-  else if(s.note)notes.push(k+': '+s.note+'（'+s.requests+' 次请求）');
-  else if(!s.records)notes.push(k+': 无数据');
- if(notes.length)warn.textContent=(warn.textContent?warn.textContent+'　':'')+notes.join(' · ');
-}
-document.querySelectorAll('.tab[data-d]').forEach(t=>t.onclick=()=>{dim=t.dataset.d;document.querySelectorAll('.tab[data-d]').forEach(x=>x.classList.toggle('on',x==t));load()});
-document.querySelectorAll('.rng').forEach(t=>t.onclick=()=>{range=t.dataset.r;document.querySelectorAll('.rng').forEach(x=>x.classList.toggle('on',x==t));load()});
-const q = new URLSearchParams(location.search);
-let uiScale = Math.min(1.4, Math.max(0.8, parseFloat(q.get('scale')) || 1));
-let uiGlass = Math.min(0.9, Math.max(0.15, parseFloat(q.get('glass')) || 0.8));
-function applyGlass(g){
-  uiGlass = g;
-  const tint = Math.max(0.04, 1 - g).toFixed(3);
-  document.querySelector('.sheet').style.background = 'rgba(12,16,24,' + tint + ')';
-  glassLab.textContent = Math.round(g * 100) + '%';
-  glassRange.value = g;
-}
-function applyScale(s){
-  uiScale = s;
-  scaleLab.textContent = Math.round(s * 100) + '%';
-  scaleRange.value = s;
-  if (document.body.classList.contains('embed')) document.documentElement.style.zoom = String(s);
-}
-let saveT;
-function saveUi(){
-  clearTimeout(saveT);
-  saveT = setTimeout(() => {
-    fetch('/api/ui', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ scale: uiScale, glass: uiGlass }) });
-    if (window.chrome && chrome.webview) chrome.webview.postMessage({ scale: uiScale, glass: uiGlass });
-  }, 180);
-}
-scaleRange.oninput = () => { uiScale = Number(scaleRange.value); scaleLab.textContent = Math.round(uiScale * 100) + '%'; saveUi(); };
-glassRange.oninput = () => { applyGlass(Number(glassRange.value)); saveUi(); };
-gear.onclick = () => {
-  const open = cfg.hasAttribute('hidden');
-  if (open) cfg.removeAttribute('hidden'); else cfg.setAttribute('hidden','');
-  if (open && !paths.dataset.loaded) {
-    fetch('/api/ui').then(r => r.json()).then(j => {
-      paths.dataset.loaded = '1';
-      paths.innerHTML = (j.paths || []).map(p => '<div class=srcpath><div class=nm>' + esc(p.name) + '</div><div class=sub>' + esc(p.models) + '</div><div class=sub>' + esc(p.path) + '</div></div>').join('');
-    });
-  }
-};
-if (location.search.indexOf('embed')>=0) {
-  document.documentElement.classList.add('embed');
-  document.body.classList.add('embed');
-  applyScale(uiScale);
-  applyGlass(uiGlass);
-  const paintBg = (u) => { document.documentElement.style.background = 'url("' + u + '") 0 0 / 100% 100% no-repeat'; };
-  window.__paintBg = paintBg;
-  const pull = () => fetch('/backdrop.jpg?t=' + Date.now()).then(r => { if (!r.ok) throw 0; return r.blob(); }).then(b => {
-    paintBg(URL.createObjectURL(b));
-  }).catch(() => setTimeout(pull, 400));
-  pull();
-} else { applyGlass(uiGlass); }
-load();
-</script>`;
+}).listen(PORT, '127.0.0.1', () => console.log(`token-meter local API: ${PORT}`));

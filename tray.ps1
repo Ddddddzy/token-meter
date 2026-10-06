@@ -24,9 +24,14 @@ $script:dpi = $_g.DpiX / 96
 $_g.Dispose()
 
 $dir  = Split-Path -Parent $MyInvocation.MyCommand.Path
+$verifyNative = $args -contains '-verify'
 $port = 3080
-$script:baseW = 560
-$script:baseH = 820
+if ($env:TOKEN_METER_PORT) { $port = [int]$env:TOKEN_METER_PORT }
+$showSignal = New-Object Threading.EventWaitHandle($false, [Threading.EventResetMode]::AutoReset, "Local\TokenMeter-Show-$port")
+$mutex = New-Object Threading.Mutex($false, "Local\TokenMeter-$port")
+if (-not $mutex.WaitOne(0, $false)) { [void]$showSignal.Set(); exit }
+$script:baseW = 380
+$script:baseH = 680
 $script:scale = 1.0
 $script:glass = 0.8
 $cfgPath = Join-Path $dir 'ui-settings.json'
@@ -86,6 +91,7 @@ function RoundRect($x, $y, $w, $h, $r) {
 }
 
 $form = New-Object AcrylicForm
+$form.Text = 'Token Meter'
 $form.AutoScaleMode = 'None'
 $form.FormBorderStyle = 'None'; $form.ShowInTaskbar = $false
 $form.TopMost = $true; $form.StartPosition = 'Manual'
@@ -138,18 +144,33 @@ $wv.add_CoreWebView2InitializationCompleted({
   $s.CoreWebView2.Settings.AreDefaultContextMenusEnabled = $false
   $s.CoreWebView2.Settings.AreDevToolsEnabled = $false
   $s.CoreWebView2.Settings.IsWebMessageEnabled = $true
+  $s.CoreWebView2.Settings.IsZoomControlEnabled = $false
+  $s.CoreWebView2.Settings.IsStatusBarEnabled = $false
   $s.CoreWebView2.add_WebMessageReceived({
     param($sender, $ev)
     try {
       $msg = $ev.WebMessageAsJson | ConvertFrom-Json
       if ($null -ne $msg.scale) { Set-WindowScale ([double]$msg.scale) }
+      if ($msg.quit) { Hide-Panel }
+      if ($msg.diagnostics -and $verifyNative) {
+        $result = @{ layout=$msg.diagnostics; formVisible=$form.Visible; width=$form.ClientSize.Width; height=$form.ClientSize.Height; dpi=$script:dpi }
+        [IO.File]::WriteAllText((Join-Path $dir 'native-verification.json'), ($result | ConvertTo-Json -Depth 8), (New-Object Text.UTF8Encoding($false)))
+      }
     } catch {}
   })
   Update-Backdrop $false
   Set-Round
 })
 $form.Controls.Add($wv)
-$wv.Source = New-Object Uri ("http://127.0.0.1:{0}/?embed=1&scale={1}&glass={2}" -f $port, $script:scale, $script:glass)
+$wv.add_NavigationCompleted({
+  param($s,$e)
+  if ($e.IsSuccess -and $verifyNative) {
+    [void]$s.CoreWebView2.ExecuteScriptAsync(@'
+setTimeout(function(){chrome.webview.postMessage({diagnostics:{ready:document.getElementById('total').textContent,scrolls:Array.from(document.querySelectorAll('*')).filter(function(e){return getComputedStyle(e).overflowY==='auto'&&e.scrollHeight>e.clientHeight+1}).map(function(e){return e.id}),footer:document.querySelector('.footer').getBoundingClientRect().bottom,viewport:innerHeight,devicePixelRatio:devicePixelRatio,errors:document.getElementById('status').textContent}})},4000)
+'@)
+  }
+})
+$wv.Source = New-Object Uri ("http://127.0.0.1:{0}/panel?embed=1&scale={1}" -f $port, $script:scale)
 
 $script:bgClient = New-Object Net.WebClient
 $script:bgSig = ''
@@ -212,30 +233,33 @@ function Set-Round {
   $hrgn = [U.U32]::CreateRoundRectRgn(0, 0, ($form.Width + 1), ($form.Height + 1), ($r * 2), ($r * 2))
   [U.U32]::SetWindowRgn($form.Handle, $hrgn, $true) | Out-Null
 }
-function Set-WindowScale([double]$scale) {
-  $scale = [Math]::Max(0.8, [Math]::Min(1.4, $scale))
-  if ([Math]::Abs($scale - $script:scale) -lt 0.01) { return }
-  $script:scale = $scale
-  $script:bgSig = ''
-  $w = [int]($script:baseW * $script:dpi * $script:scale)
-  $h = [int]($script:baseH * $script:dpi * $script:scale)
-  $was = $form.Visible
-  if ($was) { $form.Hide() }
-  $form.Size = New-Object Drawing.Size($w, $h)
-  $wa = [Windows.Forms.Screen]::PrimaryScreen.WorkingArea
-  $form.Location = New-Object Drawing.Point([Math]::Max($wa.Left, $wa.Right - $w - 12), [Math]::Max($wa.Top, $wa.Bottom - $h - 12))
+$script:resizeT = New-Object Windows.Forms.Timer
+$script:resizeT.Interval = 16
+$script:resizeClock = New-Object Diagnostics.Stopwatch
+$script:resizeT.add_Tick({
+  $p = [Math]::Min(1, $script:resizeClock.Elapsed.TotalMilliseconds / 360.0)
+  $e = 1 - [Math]::Pow(1 - $p, 4)
+  $w = [int]($script:fromW + ($script:toW - $script:fromW) * $e)
+  $h = [int]($script:fromH + ($script:toH - $script:fromH) * $e)
+  $form.SetBounds(($script:anchorRight - $w), ($script:anchorBottom - $h), $w, $h)
   Set-Round
-  if ($wv.CoreWebView2) {
-    $inv = [Globalization.CultureInfo]::InvariantCulture
-    [void]$wv.CoreWebView2.ExecuteScriptAsync(("document.documentElement.style.zoom='{0}'" -f $script:scale.ToString($inv)))
+  if ($p -ge 1 -or -not $form.Visible) { $script:resizeT.Stop(); $script:resizeClock.Stop() }
+})
+function Set-WindowScale([double]$scale) {
+  $script:scale = [Math]::Max(0.8, [Math]::Min(1.4, $scale))
+  $wa = [Windows.Forms.Screen]::FromPoint([Windows.Forms.Cursor]::Position).WorkingArea
+  $script:toW = [Math]::Min(($wa.Width - 24), [int]($script:baseW * $script:dpi * $script:scale))
+  $script:toH = [Math]::Min(($wa.Height - 24), [int]($script:baseH * $script:dpi * $script:scale))
+  $script:anchorRight = $wa.Right - 12
+  $script:anchorBottom = $wa.Bottom - 12
+  if ($form.Visible) {
+    $script:fromW = $form.Width; $script:fromH = $form.Height
+    $script:resizeClock.Restart(); $script:resizeT.Start()
+  } else {
+    $form.SetBounds(($script:anchorRight - $script:toW), ($script:anchorBottom - $script:toH), $script:toW, $script:toH)
+    Set-Round
   }
-  if ($was) {
-    Update-Backdrop $true
-    $script:shownAt = (Get-Date).Ticks
-    $form.Show()
-    [U.U32]::SetForegroundWindow($form.Handle) | Out-Null
-    Update-Backdrop $false
-  }
+  $script:bgSig = ''
 }
 function Set-ForegroundForce([IntPtr]$hwnd) {
   $pidFg = [uint32]0
@@ -252,8 +276,7 @@ function Set-ForegroundForce([IntPtr]$hwnd) {
 }
 function Show-Panel {
   if ($form.Visible) { Hide-Panel; return }
-  $wa = [Windows.Forms.Screen]::PrimaryScreen.WorkingArea
-  $form.Location = New-Object Drawing.Point(($wa.Right - $form.Width - 12), ($wa.Bottom - $form.Height - 12))
+  Set-WindowScale $script:scale
   $script:bgSig = ''
   $script:outsideArmed = $false
   $script:mouseWasDown = $true
@@ -261,6 +284,7 @@ function Show-Panel {
   Set-Round
   Set-CaptureExclude $true
   Set-ForegroundForce $form.Handle
+  if ($wv.CoreWebView2) { [void]$wv.CoreWebView2.ExecuteScriptAsync('window.__panelShown && window.__panelShown()') }
   try { Update-Backdrop $true } catch {}
 }
 
@@ -300,14 +324,22 @@ $notify.add_MouseDown({
 
 Set-Round
 $live = New-Object Windows.Forms.Timer
-$live.Interval = 80
+$live.Interval = 600
 $live.add_Tick({
-  if ($script:liveBusy -or -not $form.Visible) { return }
+  if ($script:liveBusy -or -not $form.Visible -or $script:resizeT.Enabled) { return }
   $script:liveBusy = $true
   try { Update-Backdrop $true } catch {}
   $script:liveBusy = $false
 })
 $live.Start()
 
+$openTimer = New-Object Windows.Forms.Timer
+$openTimer.Interval = 100
+$openTimer.add_Tick({ if ($showSignal.WaitOne(0)) { if (-not $form.Visible) { Show-Panel } } })
+$openTimer.Start()
+
 if ($args -contains '-show') { Show-Panel }
 [Windows.Forms.Application]::Run()
+$mutex.ReleaseMutex()
+$mutex.Dispose()
+$showSignal.Dispose()

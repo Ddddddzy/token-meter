@@ -5,3 +5,4 @@ _tray_err.txt
 ui-settings.json
 node_modules/
 *.log
+native-verification.json
