@@ -318,7 +318,7 @@ function Set-PanelProgress([double]$progress) {
 function Start-PanelMotion([double]$target) {
   $script:motionFrom = $script:visibilityProgress
   $script:motionTo = $target
-  $script:motionDuration = [Math]::Max(1.0, (360 * [Math]::Abs($target - $script:motionFrom)))
+  $script:motionDuration = [Math]::Max(1.0, (240 * [Math]::Abs($target - $script:motionFrom)))
   $script:motionClock.Restart()
   if ($wv.CoreWebView2) { [void]$wv.CoreWebView2.ExecuteScriptAsync(('document.getElementById("panel").style.pointerEvents="{0}"' -f $(if ($target -eq 1) { 'auto' } else { 'none' }))) }
   $script:motionT.Start()
