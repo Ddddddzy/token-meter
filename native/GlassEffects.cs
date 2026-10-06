@@ -3,10 +3,55 @@ using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.Runtime.InteropServices;
+using System.Diagnostics;
+using System.IO;
+using System.Security.Cryptography;
+using System.Threading;
+using System.Threading.Tasks;
+
+public sealed class GlassFrame {
+  public Rectangle Bounds;
+  public string DataUrl, Fingerprint;
+  public double WorkMilliseconds;
+  public int WorkerThreadId;
+}
 
 // The blurred background is created BEFORE it reaches WebView2. CSS cannot
 // blur windows outside its own compositor; tint/opacity must not weaken blur.
 public static class GlassEffects {
+  // No PowerShell callback runs on the worker. The UI polls one bounded task,
+  // which never waits for the token-scanning server or writes screenshots to disk.
+  public static Task<GlassFrame> CaptureAsync(Rectangle bounds, double dpi) {
+    return Task.Factory.StartNew(() => {
+      var clock = Stopwatch.StartNew();
+      using (var bitmap = Capture(bounds, dpi)) {
+        var frame = Encode(bitmap, bounds);
+        frame.WorkMilliseconds = clock.Elapsed.TotalMilliseconds;
+        frame.WorkerThreadId = Thread.CurrentThread.ManagedThreadId;
+        return frame;
+      }
+    }, CancellationToken.None, TaskCreationOptions.None, TaskScheduler.Default);
+  }
+  public static GlassFrame Encode(Bitmap bitmap, Rectangle bounds) {
+    ImageCodecInfo jpeg = null;
+    foreach (var codec in ImageCodecInfo.GetImageEncoders()) {
+      if (codec.MimeType == "image/jpeg") { jpeg = codec; break; }
+    }
+    if (jpeg == null) throw new InvalidOperationException("JPEG encoder unavailable.");
+    using (var stream = new MemoryStream())
+    using (var parameters = new EncoderParameters(1)) {
+      parameters.Param[0] = new EncoderParameter(Encoder.Quality, 55L);
+      bitmap.Save(stream, jpeg, parameters);
+      var bytes = stream.ToArray();
+      using (var hash = MD5.Create()) {
+        return new GlassFrame {
+          Bounds = bounds,
+          DataUrl = "data:image/jpeg;base64," + Convert.ToBase64String(bytes),
+          Fingerprint = Convert.ToBase64String(hash.ComputeHash(bytes))
+        };
+      }
+    }
+  }
   public static Bitmap Capture(Rectangle bounds, double dpi) {
     using (var screen = new Bitmap(bounds.Width, bounds.Height)) {
       using (var g = Graphics.FromImage(screen)) {
@@ -18,7 +63,9 @@ public static class GlassEffects {
           g.InterpolationMode = InterpolationMode.HighQualityBilinear;
           g.DrawImage(screen, 0, 0, sample.Width, sample.Height);
         }
-        return Blur(sample, 6);
+        // Match the former native + CSS blur in one pass pipeline. The browser
+        // receives fully frosted pixels and only composites their opacity.
+        return Blur(sample, 10);
       }
     }
   }

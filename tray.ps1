@@ -174,18 +174,16 @@ $wv.add_CoreWebView2InitializationCompleted({
       if ($null -ne $msg.reducedMotion) { $script:reducedMotion = [bool]$msg.reducedMotion }
       if ($msg.ready) {
         $script:panelReady = $true
-        $script:bgSig = ''
-        try { Update-Backdrop $true } catch {}
         if ($script:openRequested) { Start-PanelMotion 1 }
+        try { Update-Backdrop $true } catch {}
         if ($VerifyMotion) { $script:verifyMotionTimer.Start() }
       }
       if ($msg.diagnostics -and $verifyNative) {
-        $result = @{ layout=$msg.diagnostics; formVisible=$form.Visible; width=$form.ClientSize.Width; height=$form.ClientSize.Height; dpi=$script:dpi; motion=$script:motionSamples.ToArray(); opacity=$form.Opacity; verificationComplete=(-not $VerifyMotion -or ($script:verifyMotionPhase -ge 4 -and -not $script:motionT.Enabled -and $script:visibilityProgress -eq 1)) }
+        $result = @{ layout=$msg.diagnostics; formVisible=$form.Visible; width=$form.ClientSize.Width; height=$form.ClientSize.Height; dpi=$script:dpi; motion=$script:motionSamples.ToArray(); opacity=$form.Opacity; glassPerformance=$script:bgStats; verificationComplete=(-not $VerifyMotion -or ($script:verifyMotionPhase -ge 4 -and -not $script:motionT.Enabled -and $script:visibilityProgress -eq 1)) }
         [IO.File]::WriteAllText((Join-Path $dir 'native-verification.json'), ($result | ConvertTo-Json -Depth 8), (New-Object Text.UTF8Encoding($false)))
       }
     } catch {}
   })
-  Update-Backdrop $false
   Set-Round
 })
 $form.Controls.Add($wv)
@@ -193,65 +191,66 @@ $wv.add_NavigationCompleted({
   param($s,$e)
   if ($e.IsSuccess -and $verifyNative) {
     [void]$s.CoreWebView2.ExecuteScriptAsync(@'
-window.__nativeDiagnostics=function(){chrome.webview.postMessage({diagnostics:{ready:document.getElementById('total').textContent,scrolls:Array.from(document.querySelectorAll('*')).filter(function(e){return getComputedStyle(e).overflowY==='auto'&&e.scrollHeight>e.clientHeight+1}).map(function(e){return e.id}),footer:document.querySelector('.footer').getBoundingClientRect().bottom,viewport:innerHeight,devicePixelRatio:devicePixelRatio,glassBlur:getComputedStyle(document.getElementById('glassImage')).filter,glassImage:getComputedStyle(document.getElementById('glassImage')).backgroundImage!=='none',errors:document.getElementById('status').textContent}})};setTimeout(window.__nativeDiagnostics,5500)
+window.__nativeDiagnostics=function(){var glass=document.querySelector('.glass-image.ready');chrome.webview.postMessage({diagnostics:{ready:document.getElementById('total').textContent,scrolls:Array.from(document.querySelectorAll('*')).filter(function(e){return getComputedStyle(e).overflowY==='auto'&&e.scrollHeight>e.clientHeight+1}).map(function(e){return e.id}),footer:document.querySelector('.footer').getBoundingClientRect().bottom,viewport:innerHeight,devicePixelRatio:devicePixelRatio,glassBlur:glass?getComputedStyle(glass).filter:'none',glassImage:!!glass&&getComputedStyle(glass).backgroundImage!=='none',glassPreblurred:!!glass&&glass.classList.contains('preblurred'),glassLayers:document.querySelectorAll('.glass-image').length,errors:document.getElementById('status').textContent}})};setTimeout(window.__nativeDiagnostics,5500)
 '@)
   }
 })
 $wv.Source = New-Object Uri ("http://127.0.0.1:{0}/panel?embed=1&scale={1}" -f $port, $script:scale)
 
-$script:bgClient = New-Object Net.WebClient
 $script:bgSig = ''
-$script:jpegCodec = [Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object { $_.MimeType -eq 'image/jpeg' } | Select-Object -First 1
-$script:jpegParam = New-Object Drawing.Imaging.EncoderParameters 1
-$script:jpegParam.Param[0] = New-Object Drawing.Imaging.EncoderParameter ([Drawing.Imaging.Encoder]::Quality, [int64]55)
+$script:bgTask = $null
+$script:bgNextAt = 0
+$script:bgStats = @{ captured=0; published=0; unchanged=0; discarded=0; errors=0; maxWorkerMs=0.0; maxUiMs=0.0; totalUiMs=0.0; uiCalls=0; uiThread=[Threading.Thread]::CurrentThread.ManagedThreadId; workerThread=0 }
 function Set-CaptureExclude([bool]$on) {
   $aff = [uint32]0
   if ($on) { $aff = [uint32]0x11 }
   if ($form.IsHandleCreated) { [void][U.U32]::SetWindowDisplayAffinity($form.Handle, $aff) }
   if ($wv -and $wv.IsHandleCreated) { [void][U.U32]::SetWindowDisplayAffinity($wv.Handle, $aff) }
 }
-function Push-BackdropImage {
+function Push-BackdropImage([string]$dataUrl) {
   if (-not $wv.CoreWebView2) { return }
-  $t = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
-  $js = "if(window.__paintBg)window.__paintBg('/backdrop.jpg?t=$t');"
+  # The worker constructs JPEG base64, whose alphabet contains no JS quotes.
+  # Avoid serializing image-sized strings with PowerShell's JSON serializer.
+  $js = "if(window.__paintBg)window.__paintBg('$dataUrl',true);"
   [void]$wv.CoreWebView2.ExecuteScriptAsync($js)
 }
-function Update-Backdrop([bool]$recapture) {
-  $pushed = $false
-  if ($recapture -and $form.Width -gt 20 -and $form.Height -gt 20) {
-    Set-CaptureExclude $true
-    $captureTop = if ($script:motionT -and $script:motionT.Enabled) { $script:restTop } else { $form.Top }
-    $bounds = New-Object Drawing.Rectangle($form.Left, $captureTop, $form.Width, $form.Height)
-    $bmp = [GlassEffects]::Capture($bounds, $script:dpi)
-    try {
-    $small = New-Object Drawing.Bitmap 48, 32
-    $gs = [Drawing.Graphics]::FromImage($small)
-    $gs.InterpolationMode = 'Low'
-    $gs.DrawImage($bmp, 0, 0, 48, 32)
-    $gs.Dispose()
-    $rect = New-Object Drawing.Rectangle 0, 0, 48, 32
-    $data = $small.LockBits($rect, [Drawing.Imaging.ImageLockMode]::ReadOnly, [Drawing.Imaging.PixelFormat]::Format24bppRgb)
-    $raw = New-Object byte[] ($data.Stride * 32)
-    [Runtime.InteropServices.Marshal]::Copy($data.Scan0, $raw, 0, $raw.Length)
-    $small.UnlockBits($data)
-    $small.Dispose()
-    $md5 = [Security.Cryptography.MD5]::Create()
-    $sig = [Convert]::ToBase64String($md5.ComputeHash($raw))
-    $md5.Dispose()
-    if ($sig -ne $script:bgSig) {
-      $script:bgSig = $sig
-      $ms = New-Object IO.MemoryStream
-      $bmp.Save($ms, $script:jpegCodec, $script:jpegParam)
-      $bytes = $ms.ToArray()
-      $ms.Dispose()
+function Update-Backdrop([bool]$force) {
+  if (-not $script:panelReady -or -not $form.Visible -or -not $script:openRequested) { return }
+  $clock = [Diagnostics.Stopwatch]::StartNew()
+  try {
+    $animating = $script:motionT.Enabled -or $script:resizeT.Enabled
+    # Finished frames wait until motion completes; never repaint the glass mid-fold.
+    if (-not $animating -and $script:bgTask -and $script:bgTask.IsCompleted) {
+      $task = $script:bgTask
+      $script:bgTask = $null
       try {
-        [void]$script:bgClient.UploadData("http://127.0.0.1:$port/backdrop.jpg", 'POST', $bytes)
-        $pushed = $true
-      } catch {}
+        if ($task.IsFaulted) { throw $task.Exception.GetBaseException() }
+        if ($task.IsCanceled) { throw 'Background capture canceled.' }
+        $frame = $task.Result
+        $script:bgStats.captured++
+        $script:bgStats.workerThread = $frame.WorkerThreadId
+        $script:bgStats.maxWorkerMs = [Math]::Max($script:bgStats.maxWorkerMs, $frame.WorkMilliseconds)
+        if (-not $frame.Bounds.Equals($form.Bounds)) { $script:bgStats.discarded++ }
+        elseif ($frame.Fingerprint -ne $script:bgSig) {
+          Push-BackdropImage $frame.DataUrl
+          $script:bgSig = $frame.Fingerprint
+          $script:bgStats.published++
+        } else { $script:bgStats.unchanged++ }
+      } catch { $script:bgStats.errors++; $script:bgStats.lastError = $_.Exception.Message }
+      finally { $task.Dispose() }
     }
-    } finally { $bmp.Dispose() }
+    $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    # One in-flight task only. Hidden windows stop, and unchanged frames do not repaint.
+    if (-not $script:bgTask -and ($force -or (-not $animating -and $now -ge $script:bgNextAt))) {
+      $script:bgTask = [GlassEffects]::CaptureAsync($form.Bounds, $script:dpi)
+      $script:bgNextAt = $now + 200
+    }
+  } finally {
+    $elapsed = $clock.Elapsed.TotalMilliseconds
+    $script:bgStats.maxUiMs = [Math]::Max($script:bgStats.maxUiMs, $elapsed)
+    $script:bgStats.totalUiMs += $elapsed
+    $script:bgStats.uiCalls++
   }
-  if ($pushed) { Push-BackdropImage }
 }
 
 function Set-Round {
@@ -359,7 +358,6 @@ function Show-Panel {
     $script:restTop = $form.Top
     Set-PanelProgress 0
   }
-  $script:bgSig = ''
   $script:outsideArmed = $false
   $script:mouseWasDown = $true
   $form.Show()
@@ -367,8 +365,8 @@ function Show-Panel {
   Set-CaptureExclude $true
   Set-ForegroundForce $form.Handle
   if ($wv.CoreWebView2) { [void]$wv.CoreWebView2.ExecuteScriptAsync('window.__panelShown && window.__panelShown()') }
-  try { Update-Backdrop $true } catch {}
   if ($script:panelReady) { Start-PanelMotion 1 }
+  try { Update-Backdrop $true } catch {}
 }
 
 $iconPath = Join-Path $dir 'assets\token-meter.ico'
@@ -405,12 +403,9 @@ $notify.add_MouseDown({
 
 Set-Round
 $live = New-Object Windows.Forms.Timer
-$live.Interval = 600
+$live.Interval = 33
 $live.add_Tick({
-  if ($script:liveBusy -or -not $form.Visible -or -not $script:openRequested -or $script:motionT.Enabled -or $script:resizeT.Enabled) { return }
-  $script:liveBusy = $true
-  try { Update-Backdrop $true } catch {}
-  $script:liveBusy = $false
+  try { Update-Backdrop $false } catch {}
 })
 $live.Start()
 

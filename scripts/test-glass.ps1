@@ -25,9 +25,16 @@ try {
   $g.Clear([Drawing.Color]::FromArgb(255,67,89,113)); $g.Dispose()
   $solidBlur = [GlassEffects]::Blur($solid,6)
   if ($solidBlur.GetPixel(0,0).ToArgb() -ne $solid.GetPixel(0,0).ToArgb()) { throw 'Blur changes a uniform image or its edges.' }
+  $bounds = New-Object Drawing.Rectangle 10,20,64,64
+  $frame = [GlassEffects]::Encode($solidBlur, $bounds)
+  $same = [GlassEffects]::Encode($solidBlur, $bounds)
+  if (-not $frame.DataUrl.StartsWith('data:image/jpeg;base64,') -or -not $frame.Bounds.Equals($bounds)) { throw 'Memory frame encoding failed.' }
+  if ($frame.Fingerprint -ne $same.Fingerprint) { throw 'Identical glass frames must not trigger repaint.' }
+  $solidBlur.SetPixel(20,20,[Drawing.Color]::White)
+  if ([GlassEffects]::Encode($solidBlur, $bounds).Fingerprint -eq $frame.Fingerprint) { throw 'Changed background was not detected.' }
   if ([GlassEffects]::Ease(0) -ne 0 -or [GlassEffects]::Ease(1) -ne 1) { throw 'Animation endpoints are incorrect.' }
   if ([GlassEffects]::Ease(0.2) -gt 0.15) { throw 'Opening animation starts too abruptly.' }
   $previous = 0
   for ($i=1; $i -le 100; $i++) { $current=[GlassEffects]::Ease($i/100.0); if ($current -lt $previous -or $current -gt 1) { throw 'Animation easing is not monotonic.' }; $previous=$current }
-  Write-Output "PASS: Gaussian approximation suppresses fine detail ($min-$max), preserves solid color/alpha, and motion easing is continuous."
+  Write-Output "PASS: Gaussian approximation suppresses fine detail ($min-$max), preserves solid color/alpha; in-memory JPEG frames deduplicate identical backgrounds; motion easing is continuous."
 } finally { if ($blurred) { $blurred.Dispose() }; if ($solidBlur) { $solidBlur.Dispose() }; if ($solid) { $solid.Dispose() }; $checker.Dispose() }
