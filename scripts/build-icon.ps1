@@ -18,17 +18,18 @@ function Paint-Icon([int]$size) {
   $graphics.SmoothingMode = [Drawing.Drawing2D.SmoothingMode]::AntiAlias
   $graphics.PixelOffsetMode = [Drawing.Drawing2D.PixelOffsetMode]::HighQuality
   $graphics.ScaleTransform(($size/64.0), ($size/64.0))
-  $background = New-Object Drawing.Drawing2D.LinearGradientBrush ([Drawing.Point]::new(2,2)), ([Drawing.Point]::new(62,62)), ([Drawing.ColorTranslator]::FromHtml('#202e4a')), ([Drawing.ColorTranslator]::FromHtml('#10192c'))
-  $outline = New-Object Drawing.Pen ([Drawing.Color]::FromArgb(33,255,255,255)), 1
-  $bars = New-Object Drawing.Drawing2D.LinearGradientBrush ([Drawing.Point]::new(0,14)), ([Drawing.Point]::new(0,50)), ([Drawing.ColorTranslator]::FromHtml('#79f0de')), ([Drawing.ColorTranslator]::FromHtml('#549cff'))
-  $paths = @((RoundedPath 2 2 60 60 17), (RoundedPath 3 3 58 58 16), (RoundedPath 14 34 8 16 4), (RoundedPath 28 25 8 25 4), (RoundedPath 42 14 8 36 4))
+  $background = New-Object Drawing.SolidBrush ([Drawing.ColorTranslator]::FromHtml('#353940'))
+  $mark = New-Object Drawing.Pen ([Drawing.ColorTranslator]::FromHtml('#f3f4f6')), 4
+  $mark.StartCap = [Drawing.Drawing2D.LineCap]::Round
+  $mark.EndCap = [Drawing.Drawing2D.LineCap]::Round
+  $path = RoundedPath 2 2 60 60 17
   try {
-    $graphics.FillPath($background, $paths[0])
-    $graphics.DrawPath($outline, $paths[1])
-    foreach ($path in $paths[2..4]) { $graphics.FillPath($bars, $path) }
+    $graphics.FillPath($background, $path)
+    $graphics.DrawArc($mark, 16, 18, 32, 32, 180, 180)
+    $graphics.DrawLine($mark, 32, 35, 41, 26)
+    $graphics.DrawLine($mark, 20, 48, 44, 48)
   } finally {
-    foreach ($path in $paths) { $path.Dispose() }
-    $background.Dispose(); $outline.Dispose(); $bars.Dispose(); $graphics.Dispose()
+    $path.Dispose(); $background.Dispose(); $mark.Dispose(); $graphics.Dispose()
   }
   return $bitmap
 }

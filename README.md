@@ -7,7 +7,9 @@ Windows 本机 Agent token 用量统计工具。只有系统托盘小窗，没�
 ## 功能与开发状态
 
 - 已实现：今日 / 7 天 / 30 天 / 全部，按 Agent 与模型分组，趋势图、费用折算、模型明细。
-- 已实现：单滚动区域、长名称换行、80%–140% 缩放、平滑切换与展开动画、背景不透明度设置。
+- 已实现：单滚动区域、长名称换行、80%–140% 缩放、平滑切换与展开动画、玻璃不透明度设置。
+- 小窗打开/收起使用原生窗口向上/向下滑动与淡入淡出，支持快速反向操作；第一次打开等待 WebView2 准备完成，避免空白窗口闪现。收起按钮使用向下箭头，减少动画设置会跳过动效。
+- 磨砂背景沿用本机背景采样，但先进行三次分离盒式模糊（高斯近似）再送入 WebView2，额外设置独立模糊层、文字对比色层与边缘高光；降低不透明度也不会让背景文字恢复清晰。滑条只调玻璃色层，不降低前台文字不透明度。
 - 已实现：本机数据路径自动发现、配置文件覆盖、当前用户登录自启、多尺寸托盘图标。
 - **待开发：按设备分类。** 目前只扫描本机；没有远程设备采集、历史数据导入、同步或跨设备去重。设备按钮明确禁用，API 的主机名字段仅保留作未来扩展，不能当作已支持多设备。
 - 待开发：Cursor 精确用量接入、GUI 编辑数据路径、打包安装器，以及更多日志版本的兼容验证。
@@ -85,7 +87,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup.ps1 -RemoveA
 - `TOKEN_METER_CONFIG` 可指定外部配置文件；相对配置文件名以项目根目录为基准。
 - `TOKEN_METER_PORT` 优先于 JSON 的 `port`。显式 `sources` 优先于 Agent 的环境变量，再回退默认路径。
 - 配置在启动时读取，修改来源/端口后需要右键退出再启动。无效 JSON、未知来源或无效端口会明确报错，不会静默忽略。
-- 小窗齿轮目前只编辑窗口大小与背景不透明度，保存到项目目录的 `ui-settings.json`；数据路径是只读展示，附带已发现 / 不存在 / 已禁用状态。
+- 小窗齿轮目前只编辑窗口大小与玻璃不透明度，保存到项目目录的 `ui-settings.json`；向左更通透、向右更沉稳，基础磨砂与文字对比色层始终保留。数据路径是只读展示，附带已发现 / 不存在 / 已禁用状态。
 
 迁移建议：
 
@@ -126,9 +128,11 @@ token-meter/
 │  ├─ setup.ps1             SDK 初始化、登录自启开关
 │  ├─ start.ps1             依赖检查、错误提示、启动托盘
 │  ├─ build-icon.ps1        重建多分辨率 ICO
+│  ├─ test-glass.ps1        合成图像模糊与动画曲线测试
 │  ├─ verify.py             旧 TokenBar 独立参考，不是当前 Windows 全量验收
 │  └─ devin_compare.py      Devin 去重证据检查，可用 --db 指定数据库
 ├─ assets/                  ICO / PNG / SVG 图标
+├─ native/GlassEffects.cs    本机背景磨砂算法、窗口动效曲线
 ├─ licenses/                第三方授权说明
 └─ lib/webview2/pkg/         本机安装的 SDK（Git 忽略）
 ```
@@ -140,6 +144,7 @@ token-meter/
 ```powershell
 node --check server.mjs
 node --test server.test.mjs config.test.mjs
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\test-glass.ps1
 node server.mjs --audit
 
 # 前台启动检查（便于看错误）
