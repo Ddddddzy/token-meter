@@ -11,20 +11,21 @@ right -- `metadata.request_id`. Rows that share a `request_id` are one API call,
 however many rows they occupy.
 
 Usage:
-    python3 Scripts/devin_compare.py                 # this machine
-    ssh server1 'python3 -' < Scripts/devin_compare.py
+    python scripts/devin_compare.py
+    python scripts/devin_compare.py --db /path/to/sessions.db
 
 Exit code is 1 if the database is missing.
 """
 
 import collections
+import argparse
 import datetime
 import json
 import os
 import sqlite3
 import sys
 
-DB = os.path.expanduser("~/.local/share/devin/cli/sessions.db")
+DB = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~/.local/share')), 'devin', 'cli', 'sessions.db')
 
 FIELDS = ("input_tokens", "output_tokens", "cache_read_tokens",
           "cache_creation_tokens")
@@ -36,11 +37,14 @@ def commas(n):
 
 
 def main():
-    if not os.path.exists(DB):
-        print("no Devin database at %s" % DB, file=sys.stderr)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--db', default=DB, help='Devin sessions.db path (does not read Token Meter config.json)')
+    db_path = parser.parse_args().db
+    if not os.path.exists(db_path):
+        print("no Devin database at %s" % db_path, file=sys.stderr)
         return 1
 
-    conn = sqlite3.connect("file:%s?mode=ro" % DB, uri=True)
+    conn = sqlite3.connect("file:%s?mode=ro" % db_path.replace('\\', '/'), uri=True)
 
     naive_rows = 0
     dedup_rows = 0

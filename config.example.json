@@ -1,0 +1,12 @@
+{
+  "port": 3080,
+  "sources": {
+    "cmdc": null,
+    "codex": null,
+    "claude": null,
+    "opencode": null,
+    "devin": null,
+    "cursor": null,
+    "cursorTracking": null
+  }
+}

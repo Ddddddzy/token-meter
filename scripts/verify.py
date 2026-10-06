@@ -8,8 +8,8 @@ Prints the same `key: value` lines as `tokenbar --verify`, so the two outputs ca
 be diffed directly.
 
 Usage:
-    python3 Scripts/verify.py            # local machine
-    python3 Scripts/verify.py --naive    # also report the Claude dedup ratio
+    python scripts/verify.py            # legacy reference; not the current Windows collector
+    python scripts/verify.py --naive    # also report the Claude dedup ratio
 
 Exit code is non-zero if any collector fails outright.
 """

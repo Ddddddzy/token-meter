@@ -1,5 +1,5 @@
 ﻿// token-meter — 本地 agent token 用量汇总
-// 零依赖: Node >=22.5 (node:sqlite), 仅托盘小窗与本地 API
+// 零运行时依赖: Node >=22.13 (node:sqlite), 仅托盘小窗与本地 API
 import { DatabaseSync } from 'node:sqlite';
 import { Worker } from 'node:worker_threads';
 import http from 'node:http';
@@ -7,12 +7,13 @@ import os from 'node:os';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { loadConfig } from './config.mjs';
 
-const H = os.homedir();
 const MACHINE = os.hostname();
-const PORT = Number(process.env.TOKEN_METER_PORT) || 3080;
 const DIR = path.dirname(fileURLToPath(import.meta.url));
-const CODEX_HOME = process.env.CODEX_HOME || path.join(H, '.codex');
+const CONFIG = loadConfig();
+const PORT = CONFIG.port;
+const PATHS = CONFIG.paths;
 const UI_FILE = path.join(DIR, 'ui-settings.json');
 function readUi() {
   const ui = { scale: 1, glass: 0.8 };
@@ -22,15 +23,10 @@ function readUi() {
   return ui;
 }
 function sourcePaths() {
-  const app = process.env.APPDATA || '';
   return [
-    { name: 'Command Code', models: 'deepseek-v4-flash、v4.1-flash', path: path.join(H, '.commandcode', 'projects') },
-    { name: 'Codex', models: 'CLI / Desktop · 含归档、fork 和当前会话', path: CODEX_HOME },
-    { name: 'Devin', models: 'swe-2-high', path: path.join(app, 'devin', 'cli', 'sessions.db') },
-    { name: 'opencode', models: 'deepseek-v4-pro、step-5、mimo', path: path.join(H, '.local', 'share', 'opencode', 'opencode.db') },
-    { name: 'Cursor', models: 'grok、composer、gpt、kimi', path: path.join(app, 'Cursor', 'User', 'globalStorage', 'state.vscdb') },
-    { name: 'Claude Code', models: 'claude-sonnet-5', path: path.join(H, '.claude', 'projects') },
-  ];
+    ['cmdc', 'Command Code'], ['codex', 'Codex CLI / Desktop'], ['claude', 'Claude Code'],
+    ['opencode', 'opencode'], ['devin', 'Devin CLI'], ['cursor', 'Cursor'],
+  ].map(([id, name]) => ({ id, name, path: PATHS[id], enabled: !!PATHS[id], exists: !!PATHS[id] && fs.existsSync(PATHS[id]) }));
 }
 
 // $/1M：[未命中输入, 缓存读取, 输出]。缓存单独计价。
@@ -109,7 +105,7 @@ function listUsd(r, rate) {
 
 // ---------- 扫描器 ----------
 function* jsonlFiles(dir) {
-  if (!fs.existsSync(dir)) return;
+  if (!dir || !fs.existsSync(dir)) return;
   for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
     const p = path.join(dir, e.name);
     if (e.isDirectory()) yield* jsonlFiles(p);
@@ -121,7 +117,7 @@ const rec = (o) => ({ machine: MACHINE, in: 0, out: 0, cr: 0, cw: 0, cost: null,
 // 正在运行的 app 的 SQLite 不能直接读（WAL 读锁可能让写入方 BUSY 崩溃），
 // 复制 db+wal+shm 到临时目录再打开副本
 function openDbCopy(p) {
-  if (!fs.existsSync(p)) return null;
+  if (!p || !fs.existsSync(p)) return null;
   const tmp = path.join(os.tmpdir(), `tm-${path.basename(p)}-${process.pid}-${Date.now()}`);
   for (const s of ['', '-wal', '-shm']) {
     try { fs.copyFileSync(p + s, tmp + s); } catch {}
@@ -186,7 +182,7 @@ function scanClaudeLike(dir, cli, opt) {
 }
 function scanCmdc() {
   // costUsd 是 CLI 本地 estimateSessionCostUsd，不是账单，忽略
-  return scanClaudeLike(`${H}/.commandcode/projects`, 'cmdc', { inputIncludesCache: true, billing: 'plan' });
+  return scanClaudeLike(PATHS.cmdc, 'cmdc', { inputIncludesCache: true, billing: 'plan' });
 }
 
 // ---- Codex 用量谱系（移植自 TokenBar 的 CodexLineage）----
@@ -245,7 +241,8 @@ function codexAdvance(st, t, l) {
 }
 function codexRolloutFiles() {
   const best = new Map();
-  for (const [idx, root] of [path.join(CODEX_HOME,'sessions'),path.join(CODEX_HOME,'archived_sessions')].entries()) {
+  if (!PATHS.codex) return [];
+  for (const [idx, root] of [path.join(PATHS.codex,'sessions'),path.join(PATHS.codex,'archived_sessions')].entries()) {
     for (const f of jsonlFiles(root)) {
       const name = path.basename(f);
       if (!name.startsWith('rollout-')) continue;
@@ -385,14 +382,14 @@ function scanCodex(files = codexRolloutFiles()) {
 }
 
 function scanClaude() {
-  return scanClaudeLike(`${H}/.claude/projects`, 'claude', { inputIncludesCache: false, billing: 'list' });
+  return scanClaudeLike(PATHS.claude, 'claude', { inputIncludesCache: false, billing: 'list' });
 }
 
 function scanOpencode() {
   // 用 message 表而不是 session 表：session 的 token 是累计值，
   // 长期会话会把历史用量都算到创建日；message.data 里有逐条 tokens/cost/modelID
   const out = [];
-  const db = openDbCopy(`${H}/.local/share/opencode/opencode.db`);
+  const db = openDbCopy(PATHS.opencode);
   if (!db) return out;
   try {
     for (const m of db.prepare("select time_created, data from message where instr(data,'\"tokens\"')>0").all()) {
@@ -413,7 +410,7 @@ function scanOpencode() {
 
 function scanDevin() {
   const out = [];
-  const db = openDbCopy(`${process.env.APPDATA}/devin/cli/sessions.db`);
+  const db = openDbCopy(PATHS.devin);
   if (!db) return out;
   try {
     const models = {};
@@ -478,9 +475,9 @@ function blob(v) {
   if (typeof v === 'string') return v;
   try { return JSON.stringify(v); } catch { return ''; }
 }
-const p = process.env.APPDATA + '/Cursor/User/globalStorage/state.vscdb';
+const p = workerData.path;
 const out = [];
-if (fs.existsSync(p)) {
+if (p && fs.existsSync(p)) {
   const tmp = path.join(os.tmpdir(), 'tm-state-' + process.pid + '.vscdb');
   for (const s of ['', '-wal', '-shm']) { try { fs.copyFileSync(p + s, tmp + s); } catch {} }
   const db = new DatabaseSync(tmp, { readOnly: true });
@@ -548,7 +545,7 @@ parentPort.postMessage(out);
 let cursorWorker = null;
 function startCursorScan() {
   if (cursorWorker) return;
-  cursorWorker = new Worker(CURSOR_WORKER, { eval: true, workerData: { machine: MACHINE } });
+  cursorWorker = new Worker(CURSOR_WORKER, { eval: true, workerData: { machine: MACHINE, path: PATHS.cursor } });
   const worker = cursorWorker;
   cache.sources.cursor = {...cache.sources.cursor,pending:true};
   const kill = setTimeout(() => { try { cursorWorker?.terminate(); } catch {} }, 300000);
@@ -572,8 +569,8 @@ function startCursorScan() {
 
 function scanCursor() {
   const meta = { requests: 0, models: [], note: 'token 按会话重放估算（汉字 1、其余 /4，上下文封顶 256K）' };
-  const p = `${H}/.cursor/ai-tracking/ai-code-tracking.db`;
-  if (fs.existsSync(p)) {
+  const p = PATHS.cursor ? PATHS.cursorTracking : null;
+  if (p && fs.existsSync(p)) {
     const db = openDbCopy(p);
     try {
       meta.requests = db.prepare('select count(*) c from ai_code_hashes').get().c;
@@ -730,7 +727,7 @@ export { scanCodex, codexAdvance, usageVec, aggregate, rateFor, listUsd, scanAll
 if (isMain && process.argv.includes('--audit')) {
   const s = scanAll();
   const cursorRecs = await new Promise((resolve, reject) => {
-    const w = new Worker(CURSOR_WORKER, { eval: true, workerData: { machine: MACHINE } });
+    const w = new Worker(CURSOR_WORKER, { eval: true, workerData: { machine: MACHINE, path: PATHS.cursor } });
     const kill = setTimeout(() => reject(new Error('cursor scan timeout')), 300000);
     w.on('message', (recs) => { clearTimeout(kill); resolve(recs); });
     w.on('error', (e) => { clearTimeout(kill); reject(e); });
@@ -768,7 +765,7 @@ if (isMain) http.createServer((req, res) => {
     res.end(JSON.stringify({ ...a, range, rangeLabel: RANGE_LABEL[range], scanMs: cache.ms, at: Math.max(cache.at,cache.codexAt||0), errs: cache.errs, machine: MACHINE, sources: cache.sources }));
   } else if (u.pathname === '/api/ui' && req.method === 'GET') {
     res.setHeader('content-type', 'application/json; charset=utf-8');
-    res.end(JSON.stringify({ ...readUi(), paths: sourcePaths() }));
+    res.end(JSON.stringify({ ...readUi(), paths: sourcePaths(), configFile: CONFIG.file }));
   } else if (u.pathname === '/api/ui' && req.method === 'POST') {
     let body = '';
     req.on('data', c => { body += c; });
@@ -782,7 +779,7 @@ if (isMain) http.createServer((req, res) => {
       const saved = { scale: Math.min(1.4, Math.max(0.8, Number(cur.scale) || 1)), glass: Math.min(0.9, Math.max(0.15, Number(cur.glass) || 0.8)) };
       fs.writeFileSync(UI_FILE, JSON.stringify(saved));
       res.setHeader('content-type', 'application/json; charset=utf-8');
-      res.end(JSON.stringify({ ...saved, paths: sourcePaths() }));
+      res.end(JSON.stringify({ ...saved, paths: sourcePaths(), configFile: CONFIG.file }));
     });
     return;
   } else if (u.pathname === '/backdrop.jpg' && req.method === 'POST') {
@@ -799,12 +796,6 @@ if (isMain) http.createServer((req, res) => {
     res.setHeader('content-type', 'image/jpeg');
     res.setHeader('cache-control', 'no-store');
     res.end(backdropJpeg);
-  } else if (u.pathname === '/backdrop.png') {
-    const file = path.join(DIR, 'backdrop.png');
-    if (!fs.existsSync(file)) { res.statusCode = 404; res.end(); return; }
-    res.setHeader('content-type', 'image/png');
-    res.setHeader('cache-control', 'no-store');
-    res.end(fs.readFileSync(file));
   } else if (u.pathname === '/panel') {
     res.setHeader('content-type', 'text/html; charset=utf-8');
     res.setHeader('cache-control','no-store');

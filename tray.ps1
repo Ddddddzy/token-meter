@@ -1,4 +1,5 @@
-﻿# token-meter 托盘：小窗就是网页端，不再手绘第二套界面
+﻿# Token Meter tray: native shell with a single WebView2 panel.
+param([string]$NodePath, [switch]$Show, [switch]$Verify)
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 Add-Type -Name U32 -Namespace U -MemberDefinition @'
 [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
@@ -24,9 +25,18 @@ $script:dpi = $_g.DpiX / 96
 $_g.Dispose()
 
 $dir  = Split-Path -Parent $MyInvocation.MyCommand.Path
-$verifyNative = $args -contains '-verify'
+$verifyNative = $Verify
 $port = 3080
 if ($env:TOKEN_METER_PORT) { $port = [int]$env:TOKEN_METER_PORT }
+else {
+  $configPath = Join-Path $dir 'config.json'
+  if ($env:TOKEN_METER_CONFIG) { $configPath = $env:TOKEN_METER_CONFIG; if (-not [IO.Path]::IsPathRooted($configPath)) { $configPath = Join-Path $dir $configPath } }
+  if (Test-Path -LiteralPath $configPath) {
+    $startupConfig = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($null -ne $startupConfig.port) { $port = [int]$startupConfig.port }
+  }
+}
+if ($port -lt 1 -or $port -gt 65535) { throw 'Invalid Token Meter port.' }
 $showSignal = New-Object Threading.EventWaitHandle($false, [Threading.EventResetMode]::AutoReset, "Local\TokenMeter-Show-$port")
 $mutex = New-Object Threading.Mutex($false, "Local\TokenMeter-$port")
 if (-not $mutex.WaitOne(0, $false)) { [void]$showSignal.Set(); exit }
@@ -38,8 +48,8 @@ $cfgPath = Join-Path $dir 'ui-settings.json'
 if (Test-Path -LiteralPath $cfgPath) {
   try {
     $cfg = Get-Content -LiteralPath $cfgPath -Raw -Encoding UTF8 | ConvertFrom-Json
-    if ($cfg.scale) { $script:scale = [double]$cfg.scale }
-    if ($cfg.glass) { $script:glass = [double]$cfg.glass }
+    if ($cfg.scale) { $script:scale = [Math]::Min(1.4, [Math]::Max(0.8, [double]$cfg.scale)) }
+    if ($cfg.glass) { $script:glass = [Math]::Min(0.9, [Math]::Max(0.15, [double]$cfg.glass)) }
   } catch {}
 }
 
@@ -48,6 +58,8 @@ $native = Join-Path $sdk 'runtimes\win-x64\native'
 Add-Type -Path (Join-Path $sdk 'lib\net462\Microsoft.Web.WebView2.Core.dll')
 Add-Type -Path (Join-Path $sdk 'lib\net462\Microsoft.Web.WebView2.WinForms.dll')
 [Microsoft.Web.WebView2.Core.CoreWebView2Environment]::SetLoaderDllFolderPath($native)
+try { [Microsoft.Web.WebView2.Core.CoreWebView2Environment]::GetAvailableBrowserVersionString($null) | Out-Null }
+catch { throw 'WebView2 Runtime is missing. Install Microsoft Evergreen WebView2 Runtime, then rerun scripts\setup.ps1.' }
 Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing -TypeDefinition @'
 using System;
 using System.Drawing;
@@ -76,8 +88,10 @@ function Test-Server {
 }
 $script:node = $null
 if (-not (Test-Server)) {
-  $script:node = Start-Process node -ArgumentList 'server.mjs' -WorkingDirectory $dir -WindowStyle Hidden -PassThru
+  $nodeExecutable = if ($NodePath) { $NodePath } else { (Get-Command node.exe -ErrorAction Stop).Source }
+  $script:node = Start-Process -FilePath $nodeExecutable -ArgumentList 'server.mjs' -WorkingDirectory $dir -WindowStyle Hidden -PassThru
   for ($i = 0; $i -lt 40 -and -not (Test-Server); $i++) { Start-Sleep -Milliseconds 300 }
+  if (-not (Test-Server)) { throw 'Token Meter server did not start. Check Node.js and config.json.' }
 }
 
 $form = New-Object AcrylicForm
@@ -130,7 +144,11 @@ $wv.CreationProperties = New-Object Microsoft.Web.WebView2.WinForms.CoreWebView2
 $wv.CreationProperties.UserDataFolder = Join-Path $env:LOCALAPPDATA 'token-meter\webview'
 $wv.add_CoreWebView2InitializationCompleted({
   param($s, $e)
-  if (-not $e.IsSuccess) { return }
+  if (-not $e.IsSuccess) {
+    [void][Windows.Forms.MessageBox]::Show("WebView2 initialization failed: $($e.InitializationException.Message)", 'Token Meter', 'OK', 'Error')
+    [Windows.Forms.Application]::Exit()
+    return
+  }
   $s.CoreWebView2.Settings.AreDefaultContextMenusEnabled = $false
   $s.CoreWebView2.Settings.AreDevToolsEnabled = $false
   $s.CoreWebView2.Settings.IsWebMessageEnabled = $true
@@ -326,7 +344,7 @@ $openTimer.Interval = 100
 $openTimer.add_Tick({ if ($showSignal.WaitOne(0)) { if (-not $form.Visible) { Show-Panel } } })
 $openTimer.Start()
 
-if ($args -contains '-show') { Show-Panel }
+if ($Show) { Show-Panel }
 [Windows.Forms.Application]::Run()
 $notify.Dispose()
 $icon.Dispose()

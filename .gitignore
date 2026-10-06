@@ -6,3 +6,8 @@ ui-settings.json
 node_modules/
 *.log
 native-verification.json
+config.json
+config.local.json
+backdrop.png
+__pycache__/
+*.nupkg
