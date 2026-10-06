@@ -47,12 +47,14 @@ $script:baseW = 380
 $script:baseH = 680
 $script:scale = 1.0
 $script:glass = 0.8
+$script:blur = 50
 $cfgPath = Join-Path $dir 'ui-settings.json'
 if (Test-Path -LiteralPath $cfgPath) {
   try {
     $cfg = Get-Content -LiteralPath $cfgPath -Raw -Encoding UTF8 | ConvertFrom-Json
     if ($cfg.scale) { $script:scale = [Math]::Min(1.4, [Math]::Max(0.8, [double]$cfg.scale)) }
     if ($cfg.glass) { $script:glass = [Math]::Min(0.9, [Math]::Max(0.15, [double]$cfg.glass)) }
+    if ($null -ne $cfg.blur) { $script:blur = [int][Math]::Round([Math]::Min(100.0, [Math]::Max(0.0, [double]$cfg.blur))) }
   } catch {}
 }
 
@@ -170,6 +172,10 @@ $wv.add_CoreWebView2InitializationCompleted({
     try {
       $msg = $ev.WebMessageAsJson | ConvertFrom-Json
       if ($null -ne $msg.scale) { Set-WindowScale ([double]$msg.scale) }
+      if ($null -ne $msg.blur) {
+        $script:blur = [int][Math]::Round([Math]::Min(100.0, [Math]::Max(0.0, [double]$msg.blur)))
+        $script:bgNextAt = 0
+      }
       if ($msg.hide -or $msg.quit) { Hide-Panel }
       if ($null -ne $msg.reducedMotion) { $script:reducedMotion = [bool]$msg.reducedMotion }
       if ($msg.ready) {
@@ -179,7 +185,7 @@ $wv.add_CoreWebView2InitializationCompleted({
         if ($VerifyMotion) { $script:verifyMotionTimer.Start() }
       }
       if ($msg.diagnostics -and $verifyNative) {
-        $result = @{ layout=$msg.diagnostics; formVisible=$form.Visible; width=$form.ClientSize.Width; height=$form.ClientSize.Height; dpi=$script:dpi; motion=$script:motionSamples.ToArray(); opacity=$form.Opacity; glassPerformance=$script:bgStats; verificationComplete=(-not $VerifyMotion -or ($script:verifyMotionPhase -ge 4 -and -not $script:motionT.Enabled -and $script:visibilityProgress -eq 1)) }
+        $result = @{ layout=$msg.diagnostics; formVisible=$form.Visible; width=$form.ClientSize.Width; height=$form.ClientSize.Height; dpi=$script:dpi; motion=$script:motionSamples.ToArray(); opacity=$form.Opacity; blur=$script:blur; glassPerformance=$script:bgStats; verificationComplete=(-not $VerifyMotion -or ($script:verifyMotionPhase -ge 4 -and -not $script:motionT.Enabled -and $script:visibilityProgress -eq 1)) }
         [IO.File]::WriteAllText((Join-Path $dir 'native-verification.json'), ($result | ConvertTo-Json -Depth 8), (New-Object Text.UTF8Encoding($false)))
       }
     } catch {}
@@ -230,10 +236,11 @@ function Update-Backdrop([bool]$force) {
         $script:bgStats.captured++
         $script:bgStats.workerThread = $frame.WorkerThreadId
         $script:bgStats.maxWorkerMs = [Math]::Max($script:bgStats.maxWorkerMs, $frame.WorkMilliseconds)
-        if (-not $frame.Bounds.Equals($form.Bounds)) { $script:bgStats.discarded++ }
+        if (-not $frame.Bounds.Equals($form.Bounds) -or $frame.BlurStrength -ne $script:blur) { $script:bgStats.discarded++ }
         elseif ($frame.Fingerprint -ne $script:bgSig) {
           Push-BackdropImage $frame.DataUrl
           $script:bgSig = $frame.Fingerprint
+          $script:bgStats.presentedBlur = $frame.BlurStrength
           $script:bgStats.published++
         } else { $script:bgStats.unchanged++ }
       } catch { $script:bgStats.errors++; $script:bgStats.lastError = $_.Exception.Message }
@@ -242,7 +249,7 @@ function Update-Backdrop([bool]$force) {
     $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
     # One in-flight task only. Hidden windows stop, and unchanged frames do not repaint.
     if (-not $script:bgTask -and ($force -or (-not $animating -and $now -ge $script:bgNextAt))) {
-      $script:bgTask = [GlassEffects]::CaptureAsync($form.Bounds, $script:dpi)
+      $script:bgTask = [GlassEffects]::CaptureAsync($form.Bounds, $script:dpi, $script:blur)
       $script:bgNextAt = $now + 200
     }
   } finally {

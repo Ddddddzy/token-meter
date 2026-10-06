@@ -14,6 +14,7 @@ public sealed class GlassFrame {
   public string DataUrl, Fingerprint;
   public double WorkMilliseconds;
   public int WorkerThreadId;
+  public int BlurStrength;
 }
 
 // The blurred background is created BEFORE it reaches WebView2. CSS cannot
@@ -22,10 +23,15 @@ public static class GlassEffects {
   // No PowerShell callback runs on the worker. The UI polls one bounded task,
   // which never waits for the token-scanning server or writes screenshots to disk.
   public static Task<GlassFrame> CaptureAsync(Rectangle bounds, double dpi) {
+    return CaptureAsync(bounds, dpi, 50);
+  }
+  public static Task<GlassFrame> CaptureAsync(Rectangle bounds, double dpi, int blur) {
+    int strength = Math.Max(0, Math.Min(100, blur));
     return Task.Factory.StartNew(() => {
       var clock = Stopwatch.StartNew();
-      using (var bitmap = Capture(bounds, dpi)) {
+      using (var bitmap = Capture(bounds, dpi, strength)) {
         var frame = Encode(bitmap, bounds);
+        frame.BlurStrength = strength;
         frame.WorkMilliseconds = clock.Elapsed.TotalMilliseconds;
         frame.WorkerThreadId = Thread.CurrentThread.ManagedThreadId;
         return frame;
@@ -53,6 +59,12 @@ public static class GlassEffects {
     }
   }
   public static Bitmap Capture(Rectangle bounds, double dpi) {
+    return Capture(bounds, dpi, 50);
+  }
+  public static int RadiusForBlur(int strength) {
+    return (int)Math.Round(Math.Max(0, Math.Min(100, strength)) / 5.0);
+  }
+  public static Bitmap Capture(Rectangle bounds, double dpi, int blur) {
     using (var screen = new Bitmap(bounds.Width, bounds.Height)) {
       using (var g = Graphics.FromImage(screen)) {
         g.CopyFromScreen(bounds.Location, Point.Empty, bounds.Size);
@@ -63,9 +75,10 @@ public static class GlassEffects {
           g.InterpolationMode = InterpolationMode.HighQualityBilinear;
           g.DrawImage(screen, 0, 0, sample.Width, sample.Height);
         }
-        // Match the former native + CSS blur in one pass pipeline. The browser
-        // receives fully frosted pixels and only composites their opacity.
-        return Blur(sample, 10);
+        // Default 50% preserves the previous radius 10. Zero skips intentional
+        // blur; all strengths stay on the worker, not in the browser compositor.
+        int radius = RadiusForBlur(blur);
+        return radius == 0 ? (Bitmap)sample.Clone() : Blur(sample, radius);
       }
     }
   }

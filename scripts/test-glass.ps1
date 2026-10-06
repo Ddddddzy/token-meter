@@ -32,6 +32,17 @@ try {
   if ($frame.Fingerprint -ne $same.Fingerprint) { throw 'Identical glass frames must not trigger repaint.' }
   $solidBlur.SetPixel(20,20,[Drawing.Color]::White)
   if ([GlassEffects]::Encode($solidBlur, $bounds).Fingerprint -eq $frame.Fingerprint) { throw 'Changed background was not detected.' }
+  if ([GlassEffects]::RadiusForBlur(0) -ne 0 -or [GlassEffects]::RadiusForBlur(50) -ne 10 -or [GlassEffects]::RadiusForBlur(100) -ne 20) { throw 'Blur setting endpoints/default are incorrect.' }
+  if ([GlassEffects]::RadiusForBlur(-100) -ne 0 -or [GlassEffects]::RadiusForBlur(999) -ne 20) { throw 'Blur strength must stay bounded.' }
+  $edge = New-Object Drawing.Bitmap 128,64
+  $edgeLight = $null; $edgeStrong = $null
+  try {
+    $g = [Drawing.Graphics]::FromImage($edge)
+    try { $g.Clear([Drawing.Color]::Black); $g.FillRectangle([Drawing.Brushes]::White,64,0,64,64) } finally { $g.Dispose() }
+    $edgeLight = [GlassEffects]::Blur($edge,[GlassEffects]::RadiusForBlur(5))
+    $edgeStrong = [GlassEffects]::Blur($edge,[GlassEffects]::RadiusForBlur(100))
+    if ($edgeStrong.GetPixel(50,32).R -le $edgeLight.GetPixel(50,32).R) { throw 'Higher blur setting does not soften the edge more.' }
+  } finally { $edge.Dispose(); if ($edgeLight) {$edgeLight.Dispose()}; if ($edgeStrong) {$edgeStrong.Dispose()} }
   if ([GlassEffects]::Ease(0) -ne 0 -or [GlassEffects]::Ease(1) -ne 1) { throw 'Animation endpoints are incorrect.' }
   if ([GlassEffects]::Ease(0.2) -gt 0.15) { throw 'Opening animation starts too abruptly.' }
   $previous = 0

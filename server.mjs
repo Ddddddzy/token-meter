@@ -8,6 +8,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadConfig } from './config.mjs';
+import { readUi as readUiSettings, saveUi } from './ui-settings.mjs';
 
 const MACHINE = os.hostname();
 const DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -16,11 +17,7 @@ const PORT = CONFIG.port;
 const PATHS = CONFIG.paths;
 const UI_FILE = path.join(DIR, 'ui-settings.json');
 function readUi() {
-  const ui = { scale: 1, glass: 0.8 };
-  try { Object.assign(ui, JSON.parse(fs.readFileSync(UI_FILE, 'utf8'))); } catch {}
-  ui.scale = Math.min(1.4, Math.max(0.8, Number(ui.scale) || 1));
-  ui.glass = Math.min(0.9, Math.max(0.15, Number(ui.glass) || 0.8));
-  return ui;
+  return readUiSettings(UI_FILE);
 }
 function sourcePaths() {
   return [
@@ -770,14 +767,9 @@ if (isMain) http.createServer((req, res) => {
     let body = '';
     req.on('data', c => { body += c; });
     req.on('end', () => {
-      const cur = readUi();
-      try {
-        const j = JSON.parse(body || '{}');
-        if (j.scale != null) cur.scale = j.scale;
-        if (j.glass != null) cur.glass = j.glass;
-      } catch {}
-      const saved = { scale: Math.min(1.4, Math.max(0.8, Number(cur.scale) || 1)), glass: Math.min(0.9, Math.max(0.15, Number(cur.glass) || 0.8)) };
-      fs.writeFileSync(UI_FILE, JSON.stringify(saved));
+      let updates = {};
+      try { updates = JSON.parse(body || '{}'); } catch {}
+      const saved = saveUi(UI_FILE, updates);
       res.setHeader('content-type', 'application/json; charset=utf-8');
       res.end(JSON.stringify({ ...saved, paths: sourcePaths(), configFile: CONFIG.file }));
     });
