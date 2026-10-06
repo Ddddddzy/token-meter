@@ -80,16 +80,6 @@ if (-not (Test-Server)) {
   for ($i = 0; $i -lt 40 -and -not (Test-Server); $i++) { Start-Sleep -Milliseconds 300 }
 }
 
-$acc = [Drawing.Color]::FromArgb(91, 140, 255)
-$Bold = [Drawing.FontStyle]::Bold
-function RoundRect($x, $y, $w, $h, $r) {
-  $p = New-Object Drawing.Drawing2D.GraphicsPath
-  $d = $r * 2
-  $p.AddArc($x, $y, $d, $d, 180, 90); $p.AddArc($x+$w-$d, $y, $d, $d, 270, 90)
-  $p.AddArc($x+$w-$d, $y+$h-$d, $d, $d, 0, 90); $p.AddArc($x, $y+$h-$d, $d, $d, 90, 90)
-  $p.CloseFigure(); $p
-}
-
 $form = New-Object AcrylicForm
 $form.Text = 'Token Meter'
 $form.AutoScaleMode = 'None'
@@ -288,12 +278,10 @@ function Show-Panel {
   try { Update-Backdrop $true } catch {}
 }
 
-$bmp = New-Object Drawing.Bitmap 32, 32
-$g = [Drawing.Graphics]::FromImage($bmp)
-$g.SmoothingMode = 'AntiAlias'
-$g.FillPath((New-Object Drawing.SolidBrush($acc)), (RoundRect 0 0 32 32 8))
-$g.DrawString('T', (New-Object Drawing.Font('Segoe UI', 18, $Bold)), [Drawing.Brushes]::White, 7, 1)
-$icon = [Drawing.Icon]::FromHandle($bmp.GetHicon())
+$iconPath = Join-Path $dir 'assets\token-meter.ico'
+$trayIconSize = [int][Math]::Round(16 * $script:dpi)
+$icon = New-Object Drawing.Icon($iconPath, $trayIconSize, $trayIconSize)
+$form.Icon = $icon
 
 $menu = New-Object Windows.Forms.ContextMenuStrip
 $menu.Items.Add('显示面板') | Out-Null
@@ -340,6 +328,8 @@ $openTimer.Start()
 
 if ($args -contains '-show') { Show-Panel }
 [Windows.Forms.Application]::Run()
+$notify.Dispose()
+$icon.Dispose()
 $mutex.ReleaseMutex()
 $mutex.Dispose()
 $showSignal.Dispose()
