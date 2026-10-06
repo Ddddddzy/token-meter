@@ -17,6 +17,8 @@ Add-Type -Name U32 -Namespace U -MemberDefinition @'
 [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint a, uint b, bool attach);
 [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
 [DllImport("gdi32.dll")] public static extern System.IntPtr CreateRoundRectRgn(int l, int t, int r, int b, int rw, int rh);
+[DllImport("gdi32.dll")] public static extern System.IntPtr CreateRectRgn(int l, int t, int r, int b);
+[DllImport("gdi32.dll")] public static extern bool DeleteObject(System.IntPtr h);
 [StructLayout(LayoutKind.Sequential)]
 public struct POINT { public int X; public int Y; }
 '@
@@ -128,6 +130,7 @@ function Test-OurWindow([IntPtr]$h) {
 $focusTimer = New-Object Windows.Forms.Timer
 $focusTimer.Interval = 50
 $focusTimer.add_Tick({
+  if ($VerifyMotion) { return } # Keep synthetic open/close tests independent of outside clicks.
   if (-not $script:openRequested -or -not $script:panelReady -or -not $form.Visible -or -not $form.IsHandleCreated) { $script:outsideArmed = $false; $script:mouseWasDown = $false; return }
   $down = ([U.U32]::GetAsyncKeyState(0x01) -band 0x8000) -ne 0
   if (-not $script:outsideArmed) {
@@ -177,7 +180,7 @@ $wv.add_CoreWebView2InitializationCompleted({
         if ($VerifyMotion) { $script:verifyMotionTimer.Start() }
       }
       if ($msg.diagnostics -and $verifyNative) {
-        $result = @{ layout=$msg.diagnostics; formVisible=$form.Visible; width=$form.ClientSize.Width; height=$form.ClientSize.Height; dpi=$script:dpi; motion=$script:motionSamples.ToArray(); opacity=$form.Opacity }
+        $result = @{ layout=$msg.diagnostics; formVisible=$form.Visible; width=$form.ClientSize.Width; height=$form.ClientSize.Height; dpi=$script:dpi; motion=$script:motionSamples.ToArray(); opacity=$form.Opacity; verificationComplete=(-not $VerifyMotion -or ($script:verifyMotionPhase -ge 4 -and -not $script:motionT.Enabled -and $script:visibilityProgress -eq 1)) }
         [IO.File]::WriteAllText((Join-Path $dir 'native-verification.json'), ($result | ConvertTo-Json -Depth 8), (New-Object Text.UTF8Encoding($false)))
       }
     } catch {}
@@ -190,7 +193,7 @@ $wv.add_NavigationCompleted({
   param($s,$e)
   if ($e.IsSuccess -and $verifyNative) {
     [void]$s.CoreWebView2.ExecuteScriptAsync(@'
-setTimeout(function(){chrome.webview.postMessage({diagnostics:{ready:document.getElementById('total').textContent,scrolls:Array.from(document.querySelectorAll('*')).filter(function(e){return getComputedStyle(e).overflowY==='auto'&&e.scrollHeight>e.clientHeight+1}).map(function(e){return e.id}),footer:document.querySelector('.footer').getBoundingClientRect().bottom,viewport:innerHeight,devicePixelRatio:devicePixelRatio,glassBlur:getComputedStyle(document.getElementById('glassImage')).filter,glassImage:getComputedStyle(document.getElementById('glassImage')).backgroundImage!=='none',errors:document.getElementById('status').textContent}})},5500)
+window.__nativeDiagnostics=function(){chrome.webview.postMessage({diagnostics:{ready:document.getElementById('total').textContent,scrolls:Array.from(document.querySelectorAll('*')).filter(function(e){return getComputedStyle(e).overflowY==='auto'&&e.scrollHeight>e.clientHeight+1}).map(function(e){return e.id}),footer:document.querySelector('.footer').getBoundingClientRect().bottom,viewport:innerHeight,devicePixelRatio:devicePixelRatio,glassBlur:getComputedStyle(document.getElementById('glassImage')).filter,glassImage:getComputedStyle(document.getElementById('glassImage')).backgroundImage!=='none',errors:document.getElementById('status').textContent}})};setTimeout(window.__nativeDiagnostics,5500)
 '@)
   }
 })
@@ -253,9 +256,19 @@ function Update-Backdrop([bool]$recapture) {
 
 function Set-Round {
   if (-not $form.IsHandleCreated) { return }
-  $r = [Math]::Max(16, [int](28 * $script:dpi * $script:scale))
-  $hrgn = [U.U32]::CreateRoundRectRgn(0, 0, ($form.Width + 1), ($form.Height + 1), ($r * 2), ($r * 2))
-  [U.U32]::SetWindowRgn($form.Handle, $hrgn, $true) | Out-Null
+  # Keep the full WebView viewport stable. Only its native visible region unfolds
+  # upward from the fixed bottom edge, so text and glass never scale or reflow.
+  $script:visibleHeight = [int][Math]::Round($form.Height * $script:visibilityProgress)
+  $script:revealTop = $form.Height - $script:visibleHeight
+  if ($script:visibleHeight -eq 0) {
+    $hrgn = [U.U32]::CreateRectRgn(0, 0, 0, 0)
+  } else {
+    $r = [Math]::Min(($script:visibleHeight / 2.0), [Math]::Max(16, [int](28 * $script:dpi * $script:scale)))
+    $hrgn = [U.U32]::CreateRoundRectRgn(0, $script:revealTop, ($form.Width + 1), ($form.Height + 1), [int]($r * 2), [int]($r * 2))
+  }
+  # Windows owns a successfully assigned region; release it only on failure.
+  $script:regionApplied = [U.U32]::SetWindowRgn($form.Handle, $hrgn, $true) -ne 0
+  if (-not $script:regionApplied) { [void][U.U32]::DeleteObject($hrgn) }
 }
 $script:resizeT = New-Object Windows.Forms.Timer
 $script:resizeT.Interval = 16
@@ -296,16 +309,16 @@ $script:motionT.Interval = 16
 $script:motionClock = New-Object Diagnostics.Stopwatch
 function Set-PanelProgress([double]$progress) {
   $script:visibilityProgress = [Math]::Max(0.0, [Math]::Min(1.0, $progress))
-  $form.Top = $script:restTop + [int]([Math]::Round((1 - $script:visibilityProgress) * $script:slideDistance))
-  $form.Opacity = $script:visibilityProgress
+  Set-Round
+  $form.Opacity = if ($script:visibilityProgress -gt 0) { 1.0 } else { 0.0 }
   if ($verifyNative -and $script:motionSamples.Count -lt 120) {
-    $script:motionSamples.Add(@{ progress=$script:visibilityProgress; opacity=$form.Opacity; top=$form.Top; target=$script:motionTo; ms=$script:motionClock.Elapsed.TotalMilliseconds })
+    $script:motionSamples.Add(@{ progress=$script:visibilityProgress; opacity=$form.Opacity; top=$form.Top; bottom=$form.Bottom; visibleHeight=$script:visibleHeight; revealTop=$script:revealTop; regionApplied=$script:regionApplied; target=$script:motionTo; ms=$script:motionClock.Elapsed.TotalMilliseconds })
   }
 }
 function Start-PanelMotion([double]$target) {
   $script:motionFrom = $script:visibilityProgress
   $script:motionTo = $target
-  $script:motionDuration = [Math]::Max(1.0, (320 * [Math]::Abs($target - $script:motionFrom)))
+  $script:motionDuration = [Math]::Max(1.0, (360 * [Math]::Abs($target - $script:motionFrom)))
   $script:motionClock.Restart()
   if ($wv.CoreWebView2) { [void]$wv.CoreWebView2.ExecuteScriptAsync(('document.getElementById("panel").style.pointerEvents="{0}"' -f $(if ($target -eq 1) { 'auto' } else { 'none' }))) }
   $script:motionT.Start()
@@ -317,7 +330,12 @@ $script:motionT.add_Tick({
   if ($p -ge 1) {
     $script:motionT.Stop(); $script:motionClock.Stop()
     if ($script:motionTo -eq 0) { $form.Hide(); Set-CaptureExclude $false }
-    else { Set-ForegroundForce $form.Handle }
+    else {
+      Set-ForegroundForce $form.Handle
+      if ($VerifyMotion -and $script:verifyMotionPhase -ge 4 -and $wv.CoreWebView2) {
+        [void]$wv.CoreWebView2.ExecuteScriptAsync('window.__nativeDiagnostics && window.__nativeDiagnostics()')
+      }
+    }
   }
 })
 function Set-ForegroundForce([IntPtr]$hwnd) {
@@ -339,8 +357,6 @@ function Show-Panel {
   if (-not $form.Visible) {
     Set-WindowScale $script:scale
     $script:restTop = $form.Top
-    $wa = [Windows.Forms.Screen]::FromPoint([Windows.Forms.Cursor]::Position).WorkingArea
-    $script:slideDistance = [Math]::Min(36 * $script:dpi, $wa.Bottom - $form.Top - 24)
     Set-PanelProgress 0
   }
   $script:bgSig = ''

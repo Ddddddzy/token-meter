@@ -18,18 +18,18 @@ function Paint-Icon([int]$size) {
   $graphics.SmoothingMode = [Drawing.Drawing2D.SmoothingMode]::AntiAlias
   $graphics.PixelOffsetMode = [Drawing.Drawing2D.PixelOffsetMode]::HighQuality
   $graphics.ScaleTransform(($size/64.0), ($size/64.0))
-  $background = New-Object Drawing.SolidBrush ([Drawing.ColorTranslator]::FromHtml('#353940'))
-  $mark = New-Object Drawing.Pen ([Drawing.ColorTranslator]::FromHtml('#f3f4f6')), 4
-  $mark.StartCap = [Drawing.Drawing2D.LineCap]::Round
-  $mark.EndCap = [Drawing.Drawing2D.LineCap]::Round
+  $background = New-Object Drawing.SolidBrush ([Drawing.ColorTranslator]::FromHtml('#ffffff'))
+  $mark = New-Object Drawing.SolidBrush ([Drawing.ColorTranslator]::FromHtml('#111111'))
+  $outline = New-Object Drawing.Pen ([Drawing.ColorTranslator]::FromHtml('#dedede')), 1
   $path = RoundedPath 2 2 60 60 17
+  $bars = @((RoundedPath 14 34 8 16 4), (RoundedPath 28 25 8 25 4), (RoundedPath 42 14 8 36 4))
   try {
     $graphics.FillPath($background, $path)
-    $graphics.DrawArc($mark, 16, 18, 32, 32, 180, 180)
-    $graphics.DrawLine($mark, 32, 35, 41, 26)
-    $graphics.DrawLine($mark, 20, 48, 44, 48)
+    $graphics.DrawPath($outline, $path)
+    foreach ($bar in $bars) { $graphics.FillPath($mark, $bar) }
   } finally {
-    $path.Dispose(); $background.Dispose(); $mark.Dispose(); $graphics.Dispose()
+    foreach ($bar in $bars) { $bar.Dispose() }
+    $path.Dispose(); $background.Dispose(); $mark.Dispose(); $outline.Dispose(); $graphics.Dispose()
   }
   return $bitmap
 }
