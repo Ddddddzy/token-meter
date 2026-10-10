@@ -1,0 +1,2 @@
+# Store BAT text normalized in Git; retain Windows line endings on checkout.
+*.bat text eol=crlf

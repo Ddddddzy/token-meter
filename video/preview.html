@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Token Meter · 60 秒产品宣传片</title>
+<style>
+  :root {color-scheme:dark} * {box-sizing:border-box} body {margin:0;background:#0c0f14;color:#f5f6f8;font:18px "Times New Roman","SimSun",serif}
+  main {max-width:1280px;margin:0 auto;padding:28px 24px} header {display:flex;align-items:baseline;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:22px}
+  h1 {font-size:24px;font-weight:500;margin:0} header span,p {color:#9ba4b2;line-height:1.7} video {display:block;width:100%;aspect-ratio:16/9;border:1px solid #303742;border-radius:14px;background:#0c0f14}
+  a {color:#81b1fa} footer {display:flex;justify-content:space-between;gap:20px;flex-wrap:wrap;margin-top:18px} p {margin:0}
+  select {background:#1b2330;color:#f5f6f8;border:1px solid #303742;border-radius:7px;padding:8px 12px;font:inherit} .downloads {display:flex;gap:20px;flex-wrap:wrap}
+  .transport {display:flex;align-items:center;gap:14px;padding:12px 0;color:#9ba4b2;font-size:16px}.transport input[type=range]{flex:1;min-width:80px;accent-color:#5592ee}.transport button{background:#1b2330;color:#f5f6f8;border:1px solid #303742;border-radius:7px;padding:7px 12px;font:inherit;cursor:pointer}.transport output{font-variant-numeric:tabular-nums;min-width:86px}.transport label{white-space:nowrap}.player:fullscreen{display:flex;flex-direction:column;justify-content:center;background:#0c0f14;padding:20px}.player:fullscreen video{max-height:calc(100vh - 90px)}
+</style>
+<main>
+  <header><h1>Token Meter · 产品宣传片</h1><span>60 秒 · 原创 BGM · 无旁白</span><label>画质 <select id="quality"><option value="1080p">1080p 预览</option><option value="4k">4K 原片</option></select></label></header>
+  <div class="player" id="player"><video id="film" tabindex="0" aria-label="Token Meter 宣传片，点击播放或暂停" loop playsinline preload="metadata" poster="/token-meter-cover.png?v=film-5"><source src="/token-meter-film-60s-1080p.mp4?v=film-5" type="video/mp4"></video>
+    <div class="transport"><button id="play" type="button">播放</button><input id="progress" type="range" min="0" max="60" step="0.01" value="0" aria-label="播放进度"><output id="time">0:00 / 1:00</output><label><input id="mute" type="checkbox"> 静音</label><button id="fullscreen" type="button">全屏</button></div>
+  </div>
+  <footer><p>点击播放可听到音乐。中文宋体、英文 Times New Roman；所有用量均为演示数据。</p><div class="downloads"><a href="/token-meter-film-60s-4k.mp4" download>下载 4K 成片</a><a href="/token-meter-film-60s-1080p.mp4" download>下载 1080p</a><a href="/token-meter-cover.png" download>封面</a></div></footer>
+</main>
+<script>
+  const video = document.getElementById('film');
+  const play = document.getElementById('play'), progress = document.getElementById('progress');
+  const format = seconds => Math.floor(seconds / 60) + ':' + String(Math.floor(seconds % 60)).padStart(2, '0');
+  const toggle = () => video.paused ? video.play().catch(() => {play.textContent='重试播放';}) : video.pause();
+  play.addEventListener('click', toggle); video.addEventListener('click', toggle);
+  video.addEventListener('keydown', event => {if(event.code==='Space'){event.preventDefault();toggle();}});
+  video.addEventListener('play', () => {play.textContent='暂停';}); video.addEventListener('pause', () => {play.textContent='播放';});
+  video.addEventListener('timeupdate', () => {progress.value=video.currentTime;document.getElementById('time').textContent=format(video.currentTime)+' / '+format(video.duration||60);});
+  video.addEventListener('loadedmetadata', () => {progress.max=video.duration;});
+  progress.addEventListener('input', () => {video.currentTime=Number(progress.value);});
+  document.getElementById('mute').addEventListener('change', event => {video.muted=event.target.checked;});
+  document.getElementById('fullscreen').addEventListener('click', () => {document.fullscreenElement ? document.exitFullscreen() : document.getElementById('player').requestFullscreen();});
+  document.getElementById('quality').addEventListener('change', event => {
+    const current = video.currentTime;
+    video.pause();
+    video.src = '/token-meter-film-60s-' + event.target.value + '.mp4?v=film-5';
+    video.addEventListener('loadedmetadata', () => {video.currentTime = Math.min(current, video.duration);}, {once:true});
+    video.load();
+  });
+</script>
+</html>

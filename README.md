@@ -42,14 +42,16 @@ Windows 本机 Agent token 用量统计工具。只有系统托盘小窗，没�
 4. WebView2 SDK DLL。它与 Runtime 是两回事；初始化脚本从官方 NuGet 下载固定版本 `1.0.4191.47` 并核对固定 SHA512，SDK 不上传到 Git。
 
 ```powershell
-git clone https://github.com/Ddddddzy/token-meter.git
+git clone https://github.com/Disc13/token-meter.git
 cd token-meter
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup.ps1
+.\deploy.bat
 ```
 
-然后双击 **`token-meter.vbs`**。它是唯一日常启动入口，静默调用 `scripts/start.ps1`，检查依赖与配置后打开托盘小窗；重复启动不会创建第二个实例。托盘左键显示/收起，右键退出，Escape 或点击窗外收起。
+双击 **`deploy.bat`** 一键检查依赖、初始化 SDK、启用当前用户登录自启，并立即后台启动。无需管理员权限；它会等待托盘就绪信号（最多 30 秒），失败时保留错误信息，不会直接报告成功。Node.js / WebView2 Runtime 缺失时按提示安装后再运行；不偷偷安装系统软件。命令行可用 `deploy.bat --no-pause`。仅初始化、不启用自启可运行 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup.ps1`。
 
-旧 `启动.bat` 直接启动 PowerShell，旧 `使用.bat` 再转调 VBS，二者功能重复，现已删除。若已有快捷方式指向 BAT，请改为 `token-meter.vbs`，图标可选 `assets/token-meter.ico`。
+日常启动双击 **`token-meter.vbs`**，静默调用 `scripts/start.ps1`，检查依赖与配置后打开托盘小窗；重复启动不会创建第二个实例。托盘左键显示/收起，右键提供截图模式及退出，Escape 或点击窗外收起（截图模式例外）。自启与一键部署只显示托盘、不弹窗；图标可能在任务栏的隐藏图标区域。
+
+旧 `启动.bat` / `使用.bat` 功能重复，已删除。新的 `deploy.bat` 仅负责安装配置，不是重复的日常启动入口。若旧快捷方式指向已删除的 BAT，请改为 `token-meter.vbs`，图标可选 `assets/token-meter.ico`。
 
 首次安装 SDK 需要网络；后续正常运行不需要联网下载依赖。离线迁移可以复制已安装的 `lib/webview2/pkg`，但新设备仍需安装 Node.js 和 WebView2 Runtime。SDK/Runtime 的区别见 [微软文档](https://learn.microsoft.com/en-us/microsoft-edge/webview2/concepts/distribution)。
 
@@ -63,7 +65,18 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup.ps1 -AutoSta
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup.ps1 -RemoveAutoStart
 ```
 
-自启写入 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\TokenMeter`，不要求管理员权限。启动命令使用当前项目的绝对路径与 `--background`，登录后只显示托盘，不自动弹出小窗。**移动项目目录或换设备后，需重新运行 `setup.ps1 -AutoStart`**；Git 不会迁移 Windows 注册表。
+自启写入 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\TokenMeter`，不要求管理员权限；直接运行系统 Windows PowerShell 的 `scripts/start.ps1`（绝对路径、STA、隐藏窗口），不再依赖 VBS / Windows Script Host。安装会读取并核对注册值，重置仅本程序的旧禁用标记；不会改动其他应用的自启。注册命令超过 Windows Run 的 260 字符限制时明确报错，请缩短安装路径。重复的后台启动不会唤起已有小窗。
+
+**移动项目目录或换设备后，重新运行 `deploy.bat`**；Git 不会迁移 Windows 注册表。这里是“当前用户登录后启动”，不是未登录时运行的系统服务。若没有看到小窗，先检查隐藏托盘图标；`%LOCALAPPDATA%\token-meter\startup.log` 会记录启动、依赖检查、托盘就绪或失败原因。部署即时启动成功不等于已经验证下一次登录；实际登录验证需注销重登或重启后检查托盘与日志。
+
+## 截图兼容
+
+动态玻璃采样平时将小窗排除在屏幕捕获之外，避免采到自己形成递归残影（Windows [SetWindowDisplayAffinity](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setwindowdisplayaffinity)）。截图时需要暂时取消排除，并冻结当前玻璃背景。
+
+- 小窗打开时，`Win+Shift+S`、`PrintScreen`、`Alt+A` / `Ctrl+Alt+A` 会自动进入截图模式，适配 Windows 及微信 / QQ 常见截图快捷键。快捷键仍原样传给截图工具，不会被拦截。
+- 截图模式下不因窗外鼠标选择而收起、不刷新玻璃背景，直到点回小窗、手动关闭截图模式或收起小窗后恢复。没有超时自动恢复，长时间框选也不会突然消失。
+- 如果修改了截图快捷键、从截图工具按钮启动、快捷键钩子被安全软件禁用，或启动工具后仍漏拍，请先右键托盘 → **截图模式（点回小窗恢复）**，再使用原来的截图工具；无需安装额外工具。第三方截图工具捕获顺序各异，不能保证自动快捷键适配所有版本。
+- 全局键盘钩子仅识别上述截图组合键，不存储、上传按键，也不读取剪贴板。截图期间的后台采样结果会作废，恢复后重新采样；桌面图像不写入磁盘。
 
 ## 配置与跨设备迁移
 
@@ -90,7 +103,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup.ps1 -RemoveA
 - `TOKEN_METER_CONFIG` 可指定外部配置文件；相对配置文件名以项目根目录为基准。
 - `TOKEN_METER_PORT` 优先于 JSON 的 `port`。显式 `sources` 优先于 Agent 的环境变量，再回退默认路径。
 - 配置在启动时读取，修改来源/端口后需要右键退出再启动。无效 JSON、未知来源或无效端口会明确报错，不会静默忽略。
-- 小窗齿轮目前只编辑窗口大小与玻璃不透明度，保存到项目目录的 `ui-settings.json`；向左更通透、向右更沉稳，基础磨砂与文字对比色层始终保留。数据路径是只读展示，附带已发现 / 不存在 / 已禁用状态。
+- 小窗齿轮编辑窗口大小、玻璃不透明度与玻璃模糊度，保存到项目目录的 `ui-settings.json`；不透明度向左更通透、向右更沉稳，模糊度为 0 时不加磨砂，文字对比色层始终保留。数据路径是只读展示，附带已发现 / 不存在 / 已禁用状态。
 
 迁移建议：
 
@@ -119,6 +132,7 @@ OpenAI 计价参考：[GPT-6.1 Sol](https://developers.openai.com/api/docs/model
 ```text
 token-meter/
 ├─ token-meter.vbs          唯一日常启动入口
+├─ deploy.bat               一键初始化、启用登录自启、确认托盘就绪
 ├─ tray.ps1                 Windows 托盘 / WebView2 原生外壳
 ├─ panel.html               唯一小窗界面
 ├─ server.mjs               六类数据扫描、聚合、本地 API
@@ -130,19 +144,27 @@ token-meter/
 ├─ scripts/
 │  ├─ setup.ps1             SDK 初始化、登录自启开关
 │  ├─ start.ps1             依赖检查、错误提示、启动托盘
+│  ├─ startup.ps1           自启命令构造、路径与长度校验
+│  ├─ test-startup.ps1      自启命令与 PowerShell 语法测试
+│  ├─ test-screenshot.ps1   截图快捷键、窗口捕获状态与恢复测试
 │  ├─ build-icon.ps1        重建多分辨率 ICO
 │  ├─ test-glass.ps1        合成图像模糊与动画曲线测试
 │  ├─ verify.py             旧 TokenBar 独立参考，不是当前 Windows 全量验收
 │  └─ devin_compare.py      Devin 去重证据检查，可用 --db 指定数据库
 ├─ assets/                  ICO / PNG / SVG 图标
-├─ native/GlassEffects.cs    本机背景磨砂算法、窗口动效曲线
+├─ native/
+│  ├─ GlassEffects.cs        本机背景磨砂算法、窗口动效曲线
+│  └─ ScreenshotGuard.cs     截图模式与本机快捷键监听
 ├─ ui-settings.mjs           界面偏好校验、兼容与存储
 ├─ ui-settings.test.mjs      模糊度、零值保存与旧偏好兼容测试
 ├─ licenses/                第三方授权说明
+├─ video/                   60 秒宣传片源码、原创配乐与发布文案（独立依赖）
 └─ lib/webview2/pkg/         本机安装的 SDK（Git 忽略）
 ```
 
 本机配置、界面偏好、日志、诊断输出、依赖和截图不入版本控制。旧 `backdrop.png` 已移除；背景采样只在本机内存中直接传给小窗，不再保存为仓库文件。
+
+宣传片工程、渲染要求及人工示例数据边界见 [video/README.md](video/README.md)；[B 站](video/BILIBILI_RELEASE.md) / [小红书](video/XIAOHONGSHU_RELEASE.md) 发布文案随源码提供。成片和渲染浏览器不进 Git，视频依赖不会被 `deploy.bat` 安装，也不影响日常托盘运行。
 
 ## 开发与验证
 
@@ -150,6 +172,8 @@ token-meter/
 node --check server.mjs
 node --test server.test.mjs config.test.mjs ui-settings.test.mjs
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\test-glass.ps1
+powershell -NoProfile -STA -ExecutionPolicy Bypass -File .\scripts\test-screenshot.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\test-startup.ps1
 node server.mjs --audit
 
 # 前台启动检查（便于看错误）

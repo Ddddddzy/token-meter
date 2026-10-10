@@ -1,9 +1,11 @@
-param([switch]$AutoStart, [switch]$RemoveAutoStart)
+param([switch]$AutoStart, [switch]$RemoveAutoStart, [switch]$StartNow)
 $ErrorActionPreference = 'Stop'
 $project = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot 'startup.ps1')
 $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 if ($AutoStart -and $RemoveAutoStart) { throw 'Choose -AutoStart or -RemoveAutoStart, not both.' }
 if ($RemoveAutoStart) {
+  if ($StartNow) { throw '-StartNow cannot be combined with -RemoveAutoStart.' }
   Remove-ItemProperty -LiteralPath $runKey -Name 'TokenMeter' -ErrorAction SilentlyContinue
   Write-Output 'Token Meter sign-in startup removed for this user.'
   exit 0
@@ -18,6 +20,8 @@ $version = & $node -p 'process.versions.node'
 if ($LASTEXITCODE -ne 0 -or [version]$version -lt [version]'22.13.0') { throw 'Node.js 22.13+ is required.' }
 & $node --no-warnings -e "import('node:sqlite').catch(()=>process.exit(1))"
 if ($LASTEXITCODE -ne 0) { throw 'This Node.js build cannot load node:sqlite. Install current Node.js LTS.' }
+$port = & $node (Join-Path $project 'config.mjs') --port
+if ($LASTEXITCODE -ne 0) { throw 'Invalid configuration. Check config.json or TOKEN_METER_CONFIG before deployment.' }
 $sdkVersion = '1.0.4191.47'
 $sdkParent = Join-Path $project 'lib\webview2'
 $sdk = Join-Path $sdkParent 'pkg'
@@ -50,17 +54,32 @@ try {
   Write-Output "WebView2 Runtime: $runtimeVersion"
 } catch { throw 'Install Microsoft Evergreen WebView2 Runtime: https://developer.microsoft.com/microsoft-edge/webview2/' }
 if ($AutoStart) {
-  $launcher = Join-Path $project 'token-meter.vbs'
-  $wscript = Join-Path $env:SystemRoot 'System32\wscript.exe'
-  $command = '"' + $wscript + '" "' + $launcher + '" --background'
+  $powershell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+  $command = Get-TokenMeterStartupCommand $project $powershell
+  if (-not (Test-Path -LiteralPath $runKey)) { New-Item -Path $runKey -Force | Out-Null }
   New-ItemProperty -LiteralPath $runKey -Name 'TokenMeter' -PropertyType String -Value $command -Force | Out-Null
   $approvalKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run'
   if (Test-Path -LiteralPath $approvalKey) {
     $approval = Get-ItemProperty -LiteralPath $approvalKey -ErrorAction Stop
     if ($approval.PSObject.Properties['TokenMeter']) {
-      New-ItemProperty -LiteralPath $approvalKey -Name 'TokenMeter' -PropertyType Binary -Value ([byte[]](2,0,0,0,0,0,0,0,0,0,0,0,0)) -Force | Out-Null
+      # Reset only this app's stale disabled state. Do not fabricate undocumented
+      # StartupApproved binary records or change any other startup application.
+      Remove-ItemProperty -LiteralPath $approvalKey -Name 'TokenMeter' -ErrorAction Stop
     }
   }
-  Write-Output 'Token Meter will start silently at sign-in for this user.'
+  $registered=(Get-ItemProperty -LiteralPath $runKey -Name TokenMeter).TokenMeter
+  if ($registered -cne $command) { throw 'Startup registration read-back failed.' }
+  Write-Output "Verified sign-in startup command: $registered"
+  Write-Output 'Token Meter will start silently at sign-in for this user (tray only, no popup).'
+}
+if ($StartNow) {
+  $powershell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+  $arguments='-NoProfile -STA -WindowStyle Hidden -ExecutionPolicy Bypass -File "'+(Join-Path $project 'scripts\start.ps1')+'"'
+  $ready = New-Object Threading.EventWaitHandle($false, [Threading.EventResetMode]::ManualReset, "Local\TokenMeter-Ready-$port")
+  try {
+    Start-Process -FilePath $powershell -ArgumentList $arguments -WorkingDirectory $project -WindowStyle Hidden | Out-Null
+    if (-not $ready.WaitOne(30000)) { throw 'Tray did not become ready within 30 seconds. See %LOCALAPPDATA%\token-meter\startup.log.' }
+    Write-Output 'Tray readiness confirmed. See tray (including hidden icons) and %LOCALAPPDATA%\token-meter\startup.log.'
+  } finally { $ready.Dispose() }
 }
 Write-Output 'Ready. Double-click token-meter.vbs to open the tray panel.'

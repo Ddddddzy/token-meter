@@ -2,6 +2,7 @@
 param([string]$NodePath, [switch]$Show, [switch]$Verify, [switch]$VerifyMotion)
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 Add-Type -Path (Join-Path $PSScriptRoot 'native\GlassEffects.cs') -ReferencedAssemblies System.Drawing
+Add-Type -Path (Join-Path $PSScriptRoot 'native\ScreenshotGuard.cs')
 Add-Type -Name U32 -Namespace U -MemberDefinition @'
 [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
 [DllImport("user32.dll")] public static extern bool SetForegroundWindow(System.IntPtr h);
@@ -9,7 +10,6 @@ Add-Type -Name U32 -Namespace U -MemberDefinition @'
 [DllImport("user32.dll")] public static extern System.IntPtr GetAncestor(System.IntPtr h, uint gaFlags);
 [DllImport("user32.dll")] public static extern bool IsChild(System.IntPtr parent, System.IntPtr child);
 [DllImport("user32.dll")] public static extern int SetWindowRgn(System.IntPtr h, System.IntPtr rgn, bool redraw);
-[DllImport("user32.dll")] public static extern bool SetWindowDisplayAffinity(System.IntPtr h, uint affinity);
 [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vKey);
 [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT p);
 [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(POINT p);
@@ -42,7 +42,13 @@ else {
 if ($port -lt 1 -or $port -gt 65535) { throw 'Invalid Token Meter port.' }
 $showSignal = New-Object Threading.EventWaitHandle($false, [Threading.EventResetMode]::AutoReset, "Local\TokenMeter-Show-$port")
 $mutex = New-Object Threading.Mutex($false, "Local\TokenMeter-$port")
-if (-not $mutex.WaitOne(0, $false)) { [void]$showSignal.Set(); exit }
+if (-not $mutex.WaitOne(0, $false)) {
+  if ($Show) { [void]$showSignal.Set() }
+  $mutex.Dispose(); $showSignal.Dispose()
+  return
+}
+$readySignal = New-Object Threading.EventWaitHandle($false, [Threading.EventResetMode]::ManualReset, "Local\TokenMeter-Ready-$port")
+[void]$readySignal.Reset()
 $script:baseW = 380
 $script:baseH = 680
 $script:scale = 1.0
@@ -121,7 +127,7 @@ function Hide-Panel {
   if (-not $script:openRequested) { return }
   $script:openRequested = $false
   $script:outsideArmed = $false
-  if (-not $script:panelReady) { $form.Hide(); return }
+  if (-not $script:panelReady) { $form.Hide(); $script:captureGuard.Resume(); return }
   Start-PanelMotion 0
 }
 function Test-OurWindow([IntPtr]$h) {
@@ -144,7 +150,11 @@ $focusTimer.add_Tick({
     $pt = New-Object U.U32+POINT
     [void][U.U32]::GetCursorPos([ref]$pt)
     $hit = [U.U32]::WindowFromPoint($pt)
-    if (-not (Test-OurWindow $hit)) { Hide-Panel }
+    if ($script:captureGuard.Suspended) {
+      # The snipping overlay can select anywhere without closing this panel.
+      # Resume only on a real click back inside our window, never a timeout.
+      if (Test-OurWindow $hit) { $script:captureGuard.Resume(); $script:bgSig = ''; $script:bgNextAt = 0 }
+    } elseif (-not (Test-OurWindow $hit)) { Hide-Panel }
   }
   $script:mouseWasDown = $down
 })
@@ -193,6 +203,7 @@ $wv.add_CoreWebView2InitializationCompleted({
   Set-Round
 })
 $form.Controls.Add($wv)
+$script:captureGuard = New-Object ScreenshotGuard($form.Handle)
 $wv.add_NavigationCompleted({
   param($s,$e)
   if ($e.IsSuccess -and $verifyNative) {
@@ -205,13 +216,11 @@ $wv.Source = New-Object Uri ("http://127.0.0.1:{0}/panel?embed=1&scale={1}" -f $
 
 $script:bgSig = ''
 $script:bgTask = $null
+$script:bgTaskEpoch = 0
 $script:bgNextAt = 0
 $script:bgStats = @{ captured=0; published=0; unchanged=0; discarded=0; errors=0; maxWorkerMs=0.0; maxUiMs=0.0; totalUiMs=0.0; uiCalls=0; uiThread=[Threading.Thread]::CurrentThread.ManagedThreadId; workerThread=0 }
 function Set-CaptureExclude([bool]$on) {
-  $aff = [uint32]0
-  if ($on) { $aff = [uint32]0x11 }
-  if ($form.IsHandleCreated) { [void][U.U32]::SetWindowDisplayAffinity($form.Handle, $aff) }
-  if ($wv -and $wv.IsHandleCreated) { [void][U.U32]::SetWindowDisplayAffinity($wv.Handle, $aff) }
+  $script:captureGuard.SetExcluded($on)
 }
 function Push-BackdropImage([string]$dataUrl) {
   if (-not $wv.CoreWebView2) { return }
@@ -222,6 +231,7 @@ function Push-BackdropImage([string]$dataUrl) {
 }
 function Update-Backdrop([bool]$force) {
   if (-not $script:panelReady -or -not $form.Visible -or -not $script:openRequested) { return }
+  if ($script:captureGuard.Suspended) { return } # Freeze glass while screenshots include this window.
   $clock = [Diagnostics.Stopwatch]::StartNew()
   try {
     $animating = $script:motionT.Enabled -or $script:resizeT.Enabled
@@ -236,7 +246,7 @@ function Update-Backdrop([bool]$force) {
         $script:bgStats.captured++
         $script:bgStats.workerThread = $frame.WorkerThreadId
         $script:bgStats.maxWorkerMs = [Math]::Max($script:bgStats.maxWorkerMs, $frame.WorkMilliseconds)
-        if (-not $frame.Bounds.Equals($form.Bounds) -or $frame.BlurStrength -ne $script:blur) { $script:bgStats.discarded++ }
+        if ($script:bgTaskEpoch -ne $script:captureGuard.Epoch -or -not $frame.Bounds.Equals($form.Bounds) -or $frame.BlurStrength -ne $script:blur) { $script:bgStats.discarded++ }
         elseif ($frame.Fingerprint -ne $script:bgSig) {
           Push-BackdropImage $frame.DataUrl
           $script:bgSig = $frame.Fingerprint
@@ -249,6 +259,7 @@ function Update-Backdrop([bool]$force) {
     $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
     # One in-flight task only. Hidden windows stop, and unchanged frames do not repaint.
     if (-not $script:bgTask -and ($force -or (-not $animating -and $now -ge $script:bgNextAt))) {
+      $script:bgTaskEpoch = $script:captureGuard.Epoch
       $script:bgTask = [GlassEffects]::CaptureAsync($form.Bounds, $script:dpi, $script:blur)
       $script:bgNextAt = $now + 200
     }
@@ -293,7 +304,7 @@ function Set-WindowScale([double]$scale) {
     $script:motionT.Stop()
     $script:visibilityProgress = if ($script:openRequested) { 1.0 } else { 0.0 }
     $form.Opacity = $script:visibilityProgress
-    if (-not $script:openRequested) { $form.Hide() }
+    if (-not $script:openRequested) { $form.Hide(); $script:captureGuard.Resume() }
   }
   $script:scale = [Math]::Max(0.8, [Math]::Min(1.4, $scale))
   $wa = [Windows.Forms.Screen]::FromPoint([Windows.Forms.Cursor]::Position).WorkingArea
@@ -335,9 +346,10 @@ $script:motionT.add_Tick({
   Set-PanelProgress ($script:motionFrom + ($script:motionTo - $script:motionFrom) * $e)
   if ($p -ge 1) {
     $script:motionT.Stop(); $script:motionClock.Stop()
-    if ($script:motionTo -eq 0) { $form.Hide(); Set-CaptureExclude $false }
+    if ($script:motionTo -eq 0) { $form.Hide(); $script:captureGuard.Resume(); Set-CaptureExclude $false }
     else {
-      Set-ForegroundForce $form.Handle
+      # Do not steal focus from a capture overlay invoked during unfolding.
+      if (-not $script:captureGuard.Suspended) { Set-ForegroundForce $form.Handle }
       if ($VerifyMotion -and $script:verifyMotionPhase -ge 4 -and $wv.CoreWebView2) {
         [void]$wv.CoreWebView2.ExecuteScriptAsync('window.__nativeDiagnostics && window.__nativeDiagnostics()')
       }
@@ -383,12 +395,20 @@ $form.Icon = $icon
 
 $menu = New-Object Windows.Forms.ContextMenuStrip
 $menu.Items.Add('显示面板') | Out-Null
+$screenshotItem = $menu.Items.Add('截图模式（点回小窗恢复）')
 $menu.Items.Add('-') | Out-Null
 $menu.Items.Add('退出') | Out-Null
 $menu.add_ItemClicked({
   param($s, $e)
   switch ($e.ClickedItem.Text) {
     '显示面板' { Show-Panel }
+    '截图模式（点回小窗恢复）' {
+      if ($script:captureGuard.Suspended) { $script:captureGuard.Resume() }
+      else {
+        if (-not $script:openRequested) { Show-Panel }
+        $script:captureGuard.Suspend()
+      }
+    }
     '退出' {
       $notify.Visible = $false
       if ($script:node -and -not $script:node.HasExited) { Stop-Process -Id $script:node.Id -Force }
@@ -402,6 +422,8 @@ $notify.Icon = $icon
 $notify.Text = 'token-meter'
 $notify.ContextMenuStrip = $menu
 $notify.Visible = $true
+[void]$readySignal.Set()
+if (Get-Command Write-StartupLog -ErrorAction SilentlyContinue) { Write-StartupLog ('tray ready; screenshot hook='+$script:captureGuard.HookInstalled+' hookError='+$script:captureGuard.HookInstallationError) }
 $notify.add_MouseDown({
   param($s, $e)
   if ($e.Button -ne 'Left') { return }
@@ -412,6 +434,7 @@ Set-Round
 $live = New-Object Windows.Forms.Timer
 $live.Interval = 33
 $live.add_Tick({
+  $screenshotItem.Checked = $script:captureGuard.Suspended
   try { Update-Backdrop $false } catch {}
 })
 $live.Start()
@@ -436,6 +459,8 @@ $script:verifyMotionTimer.add_Tick({
 if ($Show) { Show-Panel }
 [Windows.Forms.Application]::Run()
 $notify.Dispose()
+$script:captureGuard.Dispose()
+$readySignal.Dispose()
 $icon.Dispose()
 $mutex.ReleaseMutex()
 $mutex.Dispose()

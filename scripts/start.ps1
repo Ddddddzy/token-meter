@@ -1,7 +1,14 @@
 param([switch]$Show)
 $ErrorActionPreference = 'Stop'
 $project = Split-Path -Parent $PSScriptRoot
+$logDirectory = Join-Path $env:LOCALAPPDATA 'token-meter'
+New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
+$logPath = Join-Path $logDirectory 'startup.log'
+function Write-StartupLog([string]$message) {
+  ('{0:o} pid={1} show={2} {3}' -f [DateTimeOffset]::Now,$PID,[bool]$Show,$message) | Add-Content -LiteralPath $logPath -Encoding UTF8
+}
 try {
+  Write-StartupLog ('starting project='+$project)
   $nodeCommand = Get-Command node.exe -ErrorAction SilentlyContinue
   if (-not $nodeCommand) {
     $nodeCandidate = Join-Path $env:ProgramFiles 'nodejs\node.exe'
@@ -19,11 +26,11 @@ try {
   if (-not (Test-Path -LiteralPath (Join-Path $sdk 'lib\net462\Microsoft.Web.WebView2.Core.dll'))) {
     throw 'WebView2 SDK is missing. Run: powershell -ExecutionPolicy Bypass -File scripts\setup.ps1'
   }
+  Write-StartupLog ('dependencies checked; Node='+$nodeVersion+' port='+$port)
   & (Join-Path $project 'tray.ps1') -NodePath $script:tokenMeterNode -Show:$Show
+  Write-StartupLog 'tray exited or existing instance reused'
 } catch {
-  $logDirectory = Join-Path $env:LOCALAPPDATA 'token-meter'
-  New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
-  $logPath = Join-Path $logDirectory 'startup.log'
+  Write-StartupLog ('FAILED: '+$_.Exception.Message)
   $_ | Out-String | Add-Content -LiteralPath $logPath -Encoding UTF8
   Add-Type -AssemblyName System.Windows.Forms
   [void][Windows.Forms.MessageBox]::Show("$($_.Exception.Message)`n`nLog: $logPath", 'Token Meter - startup failed', 'OK', 'Error')
