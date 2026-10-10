@@ -138,6 +138,7 @@ function Test-OurWindow([IntPtr]$h) {
 $focusTimer = New-Object Windows.Forms.Timer
 $focusTimer.Interval = 50
 $focusTimer.add_Tick({
+  $script:captureGuard.PollAutomatic()
   if ($VerifyMotion) { return } # Keep synthetic open/close tests independent of outside clicks.
   if (-not $script:openRequested -or -not $script:panelReady -or -not $form.Visible -or -not $form.IsHandleCreated) { $script:outsideArmed = $false; $script:mouseWasDown = $false; return }
   $down = ([U.U32]::GetAsyncKeyState(0x01) -band 0x8000) -ne 0
@@ -152,8 +153,9 @@ $focusTimer.add_Tick({
     $hit = [U.U32]::WindowFromPoint($pt)
     if ($script:captureGuard.Suspended) {
       # The snipping overlay can select anywhere without closing this panel.
-      # Resume only on a real click back inside our window, never a timeout.
+      # Auto mode ends with the capture overlay. Manual mode stays explicit.
       if (Test-OurWindow $hit) { $script:captureGuard.Resume(); $script:bgSig = ''; $script:bgNextAt = 0 }
+      elseif ($script:captureGuard.CanDismissOutside) { $script:captureGuard.Resume(); Hide-Panel }
     } elseif (-not (Test-OurWindow $hit)) { Hide-Panel }
   }
   $script:mouseWasDown = $down
@@ -395,14 +397,14 @@ $form.Icon = $icon
 
 $menu = New-Object Windows.Forms.ContextMenuStrip
 $menu.Items.Add('显示面板') | Out-Null
-$screenshotItem = $menu.Items.Add('截图模式（点回小窗恢复）')
+$screenshotItem = $menu.Items.Add('手动截图模式（点回小窗恢复）')
 $menu.Items.Add('-') | Out-Null
 $menu.Items.Add('退出') | Out-Null
 $menu.add_ItemClicked({
   param($s, $e)
   switch ($e.ClickedItem.Text) {
     '显示面板' { Show-Panel }
-    '截图模式（点回小窗恢复）' {
+    '手动截图模式（点回小窗恢复）' {
       if ($script:captureGuard.Suspended) { $script:captureGuard.Resume() }
       else {
         if (-not $script:openRequested) { Show-Panel }

@@ -8,6 +8,7 @@ Windows 本机 Agent token 用量统计工具。只有系统托盘小窗，没�
 
 - 已实现：今日 / 7 天 / 30 天 / 全部，按 Agent 与模型分组，趋势图、费用折算、模型明细。
 - 已实现：单滚动区域、长名称换行、80%–140% 缩放、平滑切换与展开动画、独立的玻璃不透明度与模糊度设置。
+- Agent / 模型切换使用整组“下沉淡出 → 上浮出现”（140ms + 210ms），先退场再替换内容，不把同色 Agent 与模型条目做位置匹配或变形。快速连点会取消旧过渡并切到最新选择；不主动滚动整个小窗，支持减少动画偏好。
 - 小窗底边固定，打开时向上展开、收起时向下折叠（约 240ms）：原生窗口区域逐帧裁切，不平移、不淡入淡出，也不拉伸文字或反复重排内容，支持快速反向操作；第一次打开等待 WebView2 准备完成。收起按钮使用向下箭头，减少动画设置会跳过动效。
 - 图标为白底黑色三根递增信号条，托盘与面板使用同一简约样式。
 - 小窗使用与原生圆角一致的完整细勾线框：浅色模式为淡灰轮廓，深色模式为浅亮轮廓，四边连续，便于与桌面背景区分；内侧保留轻微玻璃高光。轮廓仅覆盖边缘，不拦截点击、不影响文字布局，也不增加背景模糊或持续动画。
@@ -74,8 +75,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup.ps1 -RemoveA
 动态玻璃采样平时将小窗排除在屏幕捕获之外，避免采到自己形成递归残影（Windows [SetWindowDisplayAffinity](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setwindowdisplayaffinity)）。截图时需要暂时取消排除，并冻结当前玻璃背景。
 
 - 小窗打开时，`Win+Shift+S`、`PrintScreen`、`Alt+A` / `Ctrl+Alt+A` 会自动进入截图模式，适配 Windows 及微信 / QQ 常见截图快捷键。快捷键仍原样传给截图工具，不会被拦截。
-- 截图模式下不因窗外鼠标选择而收起、不刷新玻璃背景，直到点回小窗、手动关闭截图模式或收起小窗后恢复。没有超时自动恢复，长时间框选也不会突然消失。
-- 如果修改了截图快捷键、从截图工具按钮启动、快捷键钩子被安全软件禁用，或启动工具后仍漏拍，请先右键托盘 → **截图模式（点回小窗恢复）**，再使用原来的截图工具；无需安装额外工具。第三方截图工具捕获顺序各异，不能保证自动快捷键适配所有版本。
+- 自动截图模式识别 Windows / 微信 / QQ 的截图覆盖窗口：框选与编辑期间不因窗外鼠标选择而收起、不刷新玻璃背景；覆盖窗口退出后短暂等待 250ms，自动恢复，之后点击窗外仍正常收起。完成截图后直接点击其他位置也可收起，无需先点回小窗。覆盖窗口持续存在时没有固定超时；未识别到截图覆盖窗口的快捷键在 10 秒后解除，避免取消截图后永久冻结。
+- 如果修改了截图快捷键、从截图工具按钮启动、快捷键钩子被安全软件禁用，或启动工具后仍漏拍，请先右键托盘 → **手动截图模式（点回小窗恢复）**，再使用原来的截图工具；无需安装额外工具。手动模式为了兼容未知工具保持开启，需点回小窗或再次点击该菜单退出。第三方截图工具捕获顺序各异，不能保证自动快捷键适配所有版本。
 - 全局键盘钩子仅识别上述截图组合键，不存储、上传按键，也不读取剪贴板。截图期间的后台采样结果会作废，恢复后重新采样；桌面图像不写入磁盘。
 
 ## 配置与跨设备迁移
@@ -141,6 +142,7 @@ token-meter/
 ├─ model_prices.json        离线价格快照
 ├─ server.test.mjs          统计 / 去重 / 日期 / 价格测试
 ├─ config.test.mjs          路径迁移与配置测试
+├─ panel-motion.test.mjs    整组列表退场、入场与快速切换测试
 ├─ scripts/
 │  ├─ setup.ps1             SDK 初始化、登录自启开关
 │  ├─ start.ps1             依赖检查、错误提示、启动托盘
@@ -170,7 +172,7 @@ token-meter/
 
 ```powershell
 node --check server.mjs
-node --test server.test.mjs config.test.mjs ui-settings.test.mjs
+node --test server.test.mjs config.test.mjs ui-settings.test.mjs panel-motion.test.mjs
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\test-glass.ps1
 powershell -NoProfile -STA -ExecutionPolicy Bypass -File .\scripts\test-screenshot.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\test-startup.ps1
