@@ -22,6 +22,7 @@
 .footer{flex:none;display:flex;align-items:center;gap:5px;padding:8px 12px 10px 16px;border-top:1px solid var(--line);background:var(--surface)}.status{flex:1;min-width:0;white-space:normal;overflow-wrap:anywhere;color:var(--sec);font-size:10px;line-height:1.4}.icon{flex:none;border:0;border-radius:7px;background:transparent;display:grid;place-items:center;width:29px;height:29px;color:var(--sec)}.icon:hover,.icon[aria-pressed=true]{background:var(--hover);color:var(--fg)}svg{width:15px;height:15px;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}.busy svg{animation:spin 1s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}.viewghost{position:absolute;inset:0;pointer-events:none;z-index:2}
 @media(prefers-reduced-motion:reduce){:root{--duration:0ms}.content{scroll-behavior:auto}*,*::before,*::after{animation-duration:.01ms!important;transition-duration:.01ms!important}}
 .pill button:disabled{cursor:not-allowed;color:var(--sec);opacity:.5;font-size:10px}.footer{background:rgba(255,255,255,.16)}@media(prefers-color-scheme:dark){.footer{background:rgba(0,0,0,.12)}}.settinghint{font-size:10px;color:var(--sec);margin:-8px 0 12px;line-height:1.6}
+.bar i{transition-duration:360ms;transition-timing-function:cubic-bezier(.4,0,.6,1)}.listframe{overflow-anchor:none}
 </style></head><body>
 <div class="glass" aria-hidden="true"><div class="glass-image" id="glassImage"></div><div class="glass-image" id="glassNext"></div><div class="glass-wash"></div><div class="glass-tint" id="glassTint"></div></div>
 <main class="panel" id="panel">
@@ -46,46 +47,115 @@ let range='day',dimension='cli',expanded=null,data=null,request=0,controller=nul
 function select(group,value){const buttons=[...group.querySelectorAll('button')],index=buttons.findIndex(b=>b.dataset.value===value);buttons.forEach((b,i)=>b.setAttribute('aria-selected',i===index));const b=buttons[index],pill=group.querySelector('.indicator');if(b){pill.style.width=b.offsetWidth+'px';pill.style.transform='translateX('+(b.offsetLeft-3)+'px)'}}
 function initTabs(id,callback){const group=$(id);group.addEventListener('click',e=>{const b=e.target.closest('button');if(b&&!b.disabled){select(group,b.dataset.value);callback(b.dataset.value)}});group.addEventListener('keydown',e=>{if(!['ArrowLeft','ArrowRight','Home','End'].includes(e.key))return;e.preventDefault();const buttons=[...group.querySelectorAll('button:not(:disabled)')],current=buttons.indexOf(document.activeElement);const i=e.key==='Home'?0:e.key==='End'?buttons.length-1:(current+(e.key==='ArrowRight'?1:-1)+buttons.length)%buttons.length;buttons[i].focus();buttons[i].click()})}
 function bill(r){return r.noprice?'待定价':String(r.bill||'$0').replace('估算 $','≈$').replace('标价 $','$').replace('网关 $','$')}
-function row(r,key,color,label,sub='',cli=null){const pct=Math.round(r.tokens/Math.max(data.tokens,1)*100);return '<div class="row" data-key="'+esc(key)+'"'+(cli?' data-cli="'+esc(cli)+'" role="button" tabindex="0" aria-expanded="'+(expanded===cli)+'" aria-controls="detail-'+esc(cli)+'"':'')+'><div class="rowhead"><i class="dot" style="background:'+color+'"></i><span class="name">'+esc(label)+'</span>'+(cli?'<span class="chevron">›</span>':'<span></span>')+'</div>'+(sub?'<div class="sub">'+esc(sub)+'</div>':'')+'<div class="metrics"><span class="tokens">'+fmt(r.tokens)+'</span><span class="share">'+pct+'%</span><span class="cost">'+esc(bill(r))+'</span></div><div class="bar"><i style="--width:'+Math.max(.5,pct)+'%;--color:'+color+'"></i></div></div>'}
-function codexDetails(){const c=data.codex;if(!c)return '';return '<div class="codexstats">'+[['输入（含缓存）',c.input],['缓存命中',c.cached],['输出（含推理）',c.output],['其中推理',c.reasoning]].map(([label,n])=>'<div>'+label+'<strong>'+full(n)+'</strong></div>').join('')+'</div>'}
-function listHTML(){if(!data)return '';const rows=dimension==='cli'?data.byCli:dimension==='model'?data.byModel:data.byMachine;if(!rows.length)return '<div class="empty">'+esc(data.rangeLabel)+'暂无用量<br>新记录写入后会自动更新</div>';return rows.map(r=>{const cli=dimension==='cli'?r.name:null,owner=cli||r.cli,color=colorOf(owner);let html=row(r,dimension+':'+r.name,color,cli?nameOf(cli):dimension==='machine'&&r.name===data.machine?'本机 · '+r.name:r.name,dimension==='model'?(r.cli||'').split('/').map(nameOf).join(' / '):'',cli);if(cli){html+='<div class="details '+(expanded===cli?'open':'')+'" id="detail-'+esc(cli)+'"><div class="details-inner"><div class="detailpad">'+(cli==='codex'?codexDetails():'')+(data.byCliModel?.[cli]||[]).map(m=>row(m,'detail:'+cli+':'+m.name,color,m.name)).join('')+'</div></div></div>'}return html}).join('')}
-let listRevision=0,listAnimation=null;
-async function renderList(animate){
-  const list=$('list'),frame=list.parentElement,html=listHTML(),revision=++listRevision;
-  const style=getComputedStyle(list),from={opacity:Number(style.opacity),transform:style.transform};
-  animate=animate||Boolean(listAnimation);
-  listAnimation?.cancel();listAnimation=null;
-  if(!animate||motion.matches||!list.hasChildNodes()){
-    list.innerHTML=html;frame.style.minHeight='';list.inert=false;list.removeAttribute('aria-busy');return;
-  }
-  // Different dimensions are different views, not matching coloured rows.
-  // Keep one list: old view sinks completely before the new view surfaces.
-  frame.style.minHeight=frame.getBoundingClientRect().height+'px';
-  list.inert=true;list.setAttribute('aria-busy','true');
+function metric(n,format,text,cls='',prefix=''){return '<'+(cls?'span':'strong')+(cls?' class="'+cls+'"':'')+' data-number="'+Number(n||0)+'" data-format="'+format+'" data-prefix="'+esc(prefix)+'">'+esc(text)+'</'+(cls?'span':'strong')+'>'}
+function row(r,key,color,label,sub='',cli=null){const pct=Math.round(r.tokens/Math.max(data.tokens,1)*100),price=bill(r),cost=Number(r.cost??parseFloat(price.replace(/[^\d.]/g,'')))||0;return '<div class="row" data-key="'+esc(key)+'"'+(cli?' data-cli="'+esc(cli)+'" role="button" tabindex="0" aria-expanded="'+(expanded===cli)+'" aria-controls="detail-'+esc(cli)+'"':'')+'><div class="rowhead"><i class="dot" style="background:'+color+'"></i><span class="name">'+esc(label)+'</span>'+(cli?'<span class="chevron">›</span>':'<span></span>')+'</div>'+(sub?'<div class="sub">'+esc(sub)+'</div>':'')+'<div class="metrics">'+metric(r.tokens,'tokens',fmt(r.tokens),'tokens')+metric(pct,'share',pct+'%','share')+(r.noprice?'<span class="cost">'+esc(price)+'</span>':metric(cost,'cost',price,'cost',price.startsWith('≈')?'≈$':'$'))+'</div><div class="bar"><i style="--width:'+Math.max(.5,pct)+'%;--color:'+color+'"></i></div></div>'}
+function codexDetails(){const c=data.codex;if(!c)return '';return '<div class="codexstats">'+[['输入（含缓存）',c.input],['缓存命中',c.cached],['输出（含推理）',c.output],['其中推理',c.reasoning]].map(([label,n])=>'<div>'+label+metric(n,'integer',full(n))+'</div>').join('')+'</div>'}
+function listHTML(){if(!data)return '';const rows=dimension==='cli'?data.byCli:dimension==='model'?data.byModel:data.byMachine;if(!rows.length)return '<div class="empty">'+esc(data.rangeLabel)+'暂无用量<br>新记录写入后会自动更新</div>';return rows.map(r=>{const cli=dimension==='cli'?r.name:null,owner=cli||r.cli,color=colorOf(owner);let html=row(r,dimension+':'+r.name,color,cli?nameOf(cli):dimension==='machine'&&r.name===data.machine?'本机 · '+r.name:r.name,dimension==='model'?(r.cli||'').split('/').map(nameOf).join(' / '):'',cli);if(cli){html+='<div class="details '+(expanded===cli?'open':'')+'" id="detail-'+esc(cli)+'"><div class="details-inner"><div class="detailpad">'+(cli==='codex'?codexDetails():'')+(data.byCliModel?.[cli]||[]).map(m=>row(m,'detail:'+cli+':'+m.name,color,m.name)).join('')+'</div></div></div>';html='<div data-view-key="cli:'+esc(cli)+'">'+html+'</div>'}return html}).join('')}
+let listRevision=0,rowNumberFrame=0;
+const rowAnimations=new Set(),displayedMetrics=new WeakMap(),viewEase='cubic-bezier(.4,0,.6,1)';
+const nodeKey=node=>node.nodeType===1?(node.dataset.viewKey||node.dataset.key||node.id||''):'';
+function reconcileChildren(parent,next){
+  const previous=[...parent.childNodes],used=new Set(),keyed=new Map(previous.filter(nodeKey).map(node=>[nodeKey(node),node]));
+  [...next.childNodes].forEach((incoming,index)=>{
+    const key=nodeKey(incoming);
+    let current=key?keyed.get(key):previous.find(node=>!used.has(node)&&!nodeKey(node)&&node.nodeType===incoming.nodeType&&(node.nodeType!==1||(node.tagName===incoming.tagName&&node.className===incoming.className)));
+    if(current&&current.nodeType===incoming.nodeType){
+      if(current.nodeType===1){
+        [...current.attributes].forEach(a=>{if(!incoming.hasAttribute(a.name))current.removeAttribute(a.name)});
+        [...incoming.attributes].forEach(a=>{if(current.getAttribute(a.name)!==a.value)current.setAttribute(a.name,a.value)});
+        reconcileChildren(current,incoming);
+      }else if(current.nodeValue!==incoming.nodeValue)current.nodeValue=incoming.nodeValue;
+    }else current=incoming.cloneNode(true);
+    used.add(current);const at=parent.childNodes[index];if(at!==current)parent.insertBefore(current,at||null);
+  });
+  previous.forEach(node=>{if(!used.has(node))node.remove()});
+}
+function cancelRowMotion(keep=null){if(!keep){cancelAnimationFrame(rowNumberFrame);rowNumberFrame=0}rowAnimations.forEach(a=>{if(!keep||!keep.has(a.effect.target)||a.retiring){a.cancel();rowAnimations.delete(a)}})}
+function trackRowAnimation(element,frames,options,hold=false){const a=element.animate(frames,options);a.retiring=hold;rowAnimations.add(a);a.finished.catch(()=>{}).finally(()=>{if(!hold){a.cancel();rowAnimations.delete(a)}});return a}
+function metricText(element,value){switch(element.dataset.format){case 'tokens':return fmt(value);case 'share':return Math.round(value)+'%';case 'cost':return element.dataset.prefix+value.toFixed(2);default:return full(value)}}
+function listBlocks(root){return [...root.children,...root.querySelectorAll('.detailpad > .row')]}
+function parentBlockKey(el){const parent=el.closest('[data-view-key]');return parent&&parent!==el?nodeKey(parent):null}
+function visibleBlock(rect,el){const details=el?.closest('.details');if(details&&!details.classList.contains('open'))return false;const viewport=$('scroll').getBoundingClientRect();return rect.bottom>viewport.top&&rect.top<viewport.bottom}
+function blockSnapshot(){return new Map(listBlocks($('list')).map(el=>[nodeKey(el),{el,parentKey:parentBlockKey(el),rect:el.getBoundingClientRect(),opacity:Number(getComputedStyle(el).opacity)}]))}
+function numberSnapshot(){return new Map([...$('list').querySelectorAll('[data-number]')].map(el=>[el,{value:displayedMetrics.get(el)??Number(el.dataset.number),format:el.dataset.format,prefix:el.dataset.prefix}]))}
+function patchList(html,animate,before,numbers){
+  const list=$('list'),focus=document.activeElement;
+  const template=document.createElement('template');template.innerHTML=html;reconcileChildren(list,template.content);
+  if(focus&&focus.isConnected&&list.contains(focus)&&document.activeElement!==focus)focus.focus({preventScroll:true});
+  const tweens=[];
+  list.querySelectorAll('[data-number]').forEach(el=>{
+    const old=numbers.get(el),value=Number(el.dataset.number);
+    if(animate&&old&&old.format===el.dataset.format&&old.prefix===el.dataset.prefix&&old.value!==value){tweens.push({el,from:old.value,to:value,text:el.textContent});el.textContent=metricText(el,old.value)}
+    else displayedMetrics.set(el,value);
+  });
+  if(!animate)return;
+  let entering=0;
+  listBlocks(list).forEach(el=>{
+    const old=before.get(nodeKey(el)),rect=el.getBoundingClientRect(),parentKey=parentBlockKey(el);
+    if(parentKey&&!before.has(parentKey))return; // New parent owns its children's entrance.
+    if(!visibleBlock(rect,el)&&(!old||!visibleBlock(old.rect,old.el)))return;
+    if(old){const parent=parentKey?el.closest('[data-view-key]'):null,oldParent=parentKey?before.get(parentKey):null;const dy=((old.rect.top-(oldParent?.rect.top||0))-(rect.top-(parent?.getBoundingClientRect().top||0)))/scale;if(Math.abs(dy)>.5||old.opacity<.999)trackRowAnimation(el,[{transform:'translateY('+dy+'px)',opacity:old.opacity},{transform:'translateY(0px)',opacity:1}],{duration:360,easing:viewEase});}
+    else trackRowAnimation(el,[{transform:'translateY(18px)',opacity:0},{transform:'translateY(0px)',opacity:1}],{duration:320,delay:Math.min(entering++*45,160),easing:viewEase,fill:'both'});
+  });
+  if(tweens.length){const start=performance.now();function tick(now){const p=Math.min(1,(now-start)/360),e=p*p*(3-2*p);tweens.forEach(t=>{const value=t.from+(t.to-t.from)*e;displayedMetrics.set(t.el,value);t.el.textContent=p===1?t.text:metricText(t.el,value)});rowNumberFrame=p<1?requestAnimationFrame(tick):0}rowNumberFrame=requestAnimationFrame(tick)}
+}
+async function renderList(){
+  const list=$('list'),revision=++listRevision,html=listHTML();let before=blockSnapshot(),numbers=numberSnapshot();
+  list.removeAttribute('aria-busy');before.forEach(old=>{old.el.inert=false});
+  if(!list.hasChildNodes()){cancelRowMotion();list.innerHTML=html;return}
+  const template=document.createElement('template');template.innerHTML=html;
+  // Identity is typed (cli:codex vs model:gpt), never inferred from colour.
+  const wanted=new Set(listBlocks(template.content).map(nodeKey)),exits=[];
+  const leavingBlocks=[...before].filter(([key,old])=>!wanted.has(key)&&!(old.parentKey&&!wanted.has(old.parentKey))&&visibleBlock(old.rect,old.el));
+  // Retained blocks may still be moving from the last click. Let them continue
+  // during a neighbour's exit; cancel and rebase only at the layout update.
+  const keep=!motion.matches&&leavingBlocks.length?new Set([...before].filter(([key])=>wanted.has(key)).map(([,old])=>old.el)):null;
+  const returning=[...rowAnimations].filter(a=>a.retiring&&keep?.has(a.effect.target)).map(a=>a.effect.target);
+  cancelRowMotion(keep);
+  returning.forEach(el=>{const old=before.get(nodeKey(el)),dy=(old.rect.top-el.getBoundingClientRect().top)/scale;trackRowAnimation(el,[{transform:'translateY('+dy+'px)',opacity:old.opacity},{transform:'translateY(0px)',opacity:1}],{duration:360,easing:viewEase})});
+  let leaving=0;
+  if(!motion.matches)leavingBlocks.forEach(([,old])=>{
+    old.el.inert=true;
+    const dy=(old.rect.top-old.el.getBoundingClientRect().top)/scale;
+    exits.push(trackRowAnimation(old.el,[{opacity:old.opacity,transform:'translateY('+dy+'px)'},{opacity:0,transform:'translateY('+(dy+18)+'px)'}],{duration:220,delay:Math.min(leaving++*30,120),easing:viewEase,fill:'forwards'},true));
+  });
   try{
-    listAnimation=list.animate([from,{opacity:0,transform:'translateY(14px)'}],{duration:140,easing:'cubic-bezier(.4,0,1,1)',fill:'forwards'});
-    await listAnimation.finished;if(revision!==listRevision)return;
-    list.innerHTML=html;listAnimation.cancel();
-    listAnimation=list.animate([{opacity:0,transform:'translateY(14px)'},{opacity:1,transform:'translateY(0px)'}],{duration:210,easing:'cubic-bezier(.22,1,.36,1)',fill:'both'});
-    await listAnimation.finished;
-  }catch{}finally{
-    if(revision===listRevision){listAnimation?.cancel();listAnimation=null;frame.style.minHeight='';list.inert=false;list.removeAttribute('aria-busy')}
+    if(exits.length){list.setAttribute('aria-busy','true');await Promise.all(exits.map(a=>a.finished))}
+    if(revision!==listRevision)return;
+    if(exits.length){before=blockSnapshot();numbers=numberSnapshot();cancelRowMotion()}
+    // Read current data/expansion after exits, not a stale captured snapshot.
+    patchList(listHTML(),!motion.matches,before,numbers);
+  }catch(error){if(revision===listRevision&&error.name!=='AbortError')$('status').textContent='列表更新失败：'+error.message}finally{
+    exits.forEach(a=>{a.cancel();rowAnimations.delete(a)});
+    if(revision===listRevision){list.removeAttribute('aria-busy');before.forEach(old=>{if(old.el.isConnected)old.el.inert=false})}
   }
 }
-function toggleCLI(cli){expanded=expanded===cli?null:cli;$('list').querySelectorAll('[data-cli]').forEach(row=>{const open=row.dataset.cli===expanded;row.setAttribute('aria-expanded',open);$('detail-'+row.dataset.cli)?.classList.toggle('open',open)})}
+function listSignature(next){return JSON.stringify([dimension,range,expanded,next.byCli,next.byModel,next.byMachine,next.byCliModel,next.codex])}
+function toggleCLI(cli){expanded=expanded===cli?null:cli;$('list').querySelectorAll('[data-cli]').forEach(row=>{const open=row.dataset.cli===expanded;row.setAttribute('aria-expanded',open);$('detail-'+row.dataset.cli)?.classList.toggle('open',open)});if(data)lastSignature=listSignature(data)}
 $('list').addEventListener('click',e=>{const r=e.target.closest('[data-cli]');if(r)toggleCLI(r.dataset.cli)});$('list').addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' '){const r=e.target.closest('[data-cli]');if(r){e.preventDefault();toggleCLI(r.dataset.cli)}}});
-function animateNumbers(old,next){cancelAnimationFrame(numberFrame);const start=performance.now(),duration=motion.matches?0:460;function frame(now){const p=duration?Math.min(1,(now-start)/duration):1,e=1-Math.pow(1-p,4),tk=(old?.tokens||0)+(next.tokens-(old?.tokens||0))*e,cost=(old?.cost||0)+(next.cost-(old?.cost||0))*e;$('total').textContent=fmt(tk);$('cost').textContent='$'+cost.toFixed(2);if(p<1)numberFrame=requestAnimationFrame(frame)}numberFrame=requestAnimationFrame(frame)}
+let displayedSummary=null,displayedChart=[];
+function animateNumbers(old,next){cancelAnimationFrame(numberFrame);const from=displayedSummary||{tokens:next.tokens,cost:next.cost},start=performance.now(),duration=!old||motion.matches?0:360;function frame(now){const p=duration?Math.min(1,(now-start)/duration):1,e=p*p*(3-2*p),tk=from.tokens+(next.tokens-from.tokens)*e,cost=from.cost+(next.cost-from.cost)*e;displayedSummary={tokens:tk,cost};$('total').textContent=fmt(tk);$('cost').textContent='$'+cost.toFixed(2);if(p<1)numberFrame=requestAnimationFrame(frame)}numberFrame=requestAnimationFrame(frame)}
 const canvas=$('chart'),ctx=canvas.getContext('2d');
-function chartDraw(progress=1){if(!data)return;const rect=canvas.getBoundingClientRect(),dpr=window.devicePixelRatio||1,W=rect.width,H=72;if(canvas.width!==Math.round(W*dpr)||canvas.height!==Math.round(H*dpr)){canvas.width=Math.round(W*dpr);canvas.height=Math.round(H*dpr)}ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,W,H);const stacks=data.stacks||[],n=stacks.length||1,slot=W/n,bw=Math.max(1,slot-Math.min(6,slot*.3));const old=new Map(previousChart.map(x=>[x.label,x.parts]));const bins=stacks.map(x=>{const parts={},keys=new Set([...Object.keys(x.parts),...Object.keys(old.get(x.label)||{})]);for(const k of keys){const a=old.get(x.label)?.[k]||0;parts[k]=a+((x.parts[k]||0)-a)*progress}return parts});const peak=Math.max(1,...bins.map(p=>Object.values(p).reduce((a,b)=>a+b,0))),track=getComputedStyle(document.documentElement).getPropertyValue('--track').trim();bins.forEach((parts,i)=>{let bottom=H;if(i===hover){ctx.fillStyle=track;ctx.fillRect(i*slot,0,slot,H)}const total=Object.values(parts).reduce((a,b)=>a+b,0);if(!total){ctx.fillStyle=track;ctx.fillRect(i*slot+(slot-bw)/2,H-3,bw,3);return}Object.keys(parts).sort().forEach(cli=>{const h=parts[cli]/peak*(H-4);ctx.fillStyle=colorOf(cli);ctx.globalAlpha=hover<0||hover===i?1:.45;ctx.fillRect(i*slot+(slot-bw)/2,bottom-h,bw,Math.max(.5,h));bottom-=h});ctx.globalAlpha=1})}
-function animateChart(old){cancelAnimationFrame(chartFrame);previousChart=old?.stacks||[];const start=performance.now(),duration=motion.matches?0:460;function frame(now){const p=duration?Math.min(1,(now-start)/duration):1;chartProgress=1-Math.pow(1-p,4);chartDraw(chartProgress);if(p<1)chartFrame=requestAnimationFrame(frame)}chartFrame=requestAnimationFrame(frame)}
+function chartDraw(progress=1){
+  if(!data)return;
+  const rect=canvas.getBoundingClientRect(),dpr=window.devicePixelRatio||1,W=rect.width,H=72;
+  if(canvas.width!==Math.round(W*dpr)||canvas.height!==Math.round(H*dpr)){canvas.width=Math.round(W*dpr);canvas.height=Math.round(H*dpr)}
+  ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,W,H);
+  const stacks=data.stacks||[],n=stacks.length||1,slot=W/n,bw=Math.max(1,slot-Math.min(6,slot*.3)),old=new Map(previousChart.map(x=>[x.label,x.parts]));
+  const bins=stacks.map(x=>{const parts={},keys=new Set([...Object.keys(x.parts),...Object.keys(old.get(x.label)||{})]);for(const k of keys){const a=old.get(x.label)?.[k]||0;parts[k]=a+((x.parts[k]||0)-a)*progress}return parts});
+  displayedChart=stacks.map((x,i)=>({label:x.label,parts:{...bins[i]}}));
+  const peak=Math.max(1,...bins.map(p=>Object.values(p).reduce((a,b)=>a+b,0))),track=getComputedStyle(document.documentElement).getPropertyValue('--track').trim();
+  bins.forEach((parts,i)=>{let bottom=H;if(i===hover){ctx.fillStyle=track;ctx.fillRect(i*slot,0,slot,H)}const total=Object.values(parts).reduce((a,b)=>a+b,0);if(!total){ctx.fillStyle=track;ctx.fillRect(i*slot+(slot-bw)/2,H-3,bw,3);return}Object.keys(parts).sort().forEach(cli=>{const h=parts[cli]/peak*(H-4);ctx.fillStyle=colorOf(cli);ctx.globalAlpha=hover<0||hover===i?1:.45;ctx.fillRect(i*slot+(slot-bw)/2,bottom-h,bw,Math.max(.5,h));bottom-=h});ctx.globalAlpha=1});
+}
+function animateChart(old){cancelAnimationFrame(chartFrame);previousChart=displayedChart.length?displayedChart:(old?.stacks||[]);const start=performance.now(),duration=!old||motion.matches?0:360;function frame(now){const p=duration?Math.min(1,(now-start)/duration):1;chartProgress=p*p*(3-2*p);chartDraw(chartProgress);if(p<1)chartFrame=requestAnimationFrame(frame)}chartFrame=requestAnimationFrame(frame)}
 function chartHead(){if(!data)return;const bins=data.stacks||[],bin=bins[hover],keys=[...new Set(bins.flatMap(x=>Object.keys(x.parts)))];$('chartTitle').textContent=bin?bin.label:data.chartLabel;$('chartValue').textContent=bin?fmt(Object.values(bin.parts).reduce((a,b)=>a+b,0))+' tokens':bins.length?'合计 '+fmt(data.tokens):'';$('legend').innerHTML=keys.map(cli=>'<span><i style="background:'+colorOf(cli)+'"></i>'+esc(nameOf(cli))+(bin?' '+fmt(bin.parts[cli]||0):'')+'</span>').join('');$('axis').innerHTML=(bins.length<=4?bins:bins.filter((_,i)=>i===0||i===bins.length-1||i===Math.floor(bins.length/2))).map(x=>'<span>'+esc(x.label)+'</span>').join('')}
 canvas.addEventListener('mousemove',e=>{if(!data)return;const r=canvas.getBoundingClientRect();hover=Math.min(data.stacks.length-1,Math.max(0,Math.floor((e.clientX-r.left)/r.width*data.stacks.length)));chartDraw(chartProgress);chartHead()});canvas.addEventListener('mouseleave',()=>{hover=-1;chartDraw(chartProgress);chartHead()});
-function render(next,animate){const old=data;data=next;hover=-1;$('sumLabel').textContent=next.rangeLabel+'用量';$('exact').textContent=full(next.tokens);$('coverage').textContent=next.tokens?(next.pricedPct===100?'全部已计价':next.pricedPct+'% 已计价'):'暂无用量';$('moneyNote').textContent=next.moneyNote;$('moneyNote').title='用量估价不代表订阅实际扣款';const signature=JSON.stringify([dimension,range,expanded,next.byCli,next.byModel,next.byMachine,next.byCliModel,next.codex]);if(signature!==lastSignature){renderList(animate);lastSignature=signature}if(!old||old.tokens!==next.tokens||old.cost!==next.cost)animateNumbers(old,next);if(!old||JSON.stringify(old.stacks)!==JSON.stringify(next.stacks))animateChart(old);else chartDraw();chartHead();const notes=[];if(next.unpriced.length)notes.push(next.unpriced.length+' 个模型暂无公开价格，token 已计入；费用暂未计入。');if(next.estPct)notes.push('≈ 表示采用估算 token 或参考费率。');if(next.sources?.cursor?.pending)notes.push('Cursor 估算仍在后台扫描，完成后自动更新。');if(next.errs?.length)notes.push('扫描异常：'+next.errs.join('；'));$('notes').textContent=notes.join(' ');$('status').textContent='更新于 '+new Date(next.at).toLocaleTimeString('zh-CN',{hour12:false})+' · '+next.machine+' · 扫描 '+next.scanMs+'ms';$('liveLabel').textContent=next.codex?.lastAt&&Date.now()-next.codex.lastAt<90000?'Codex 正在更新':'本机用量';select($('rangeTabs'),range);select($('dimensionTabs'),dimension)}
+function render(next,animate){const old=data;data=next;hover=-1;$('sumLabel').textContent=next.rangeLabel+'用量';$('exact').textContent=full(next.tokens);$('coverage').textContent=next.tokens?(next.pricedPct===100?'全部已计价':next.pricedPct+'% 已计价'):'暂无用量';$('moneyNote').textContent=next.moneyNote;$('moneyNote').title='用量估价不代表订阅实际扣款';const signature=listSignature(next);if(signature!==lastSignature){renderList();lastSignature=signature}if(!old||old.tokens!==next.tokens||old.cost!==next.cost)animateNumbers(old,next);if(!old||JSON.stringify(old.stacks)!==JSON.stringify(next.stacks))animateChart(old);else chartDraw(chartProgress);chartHead();const notes=[];if(next.unpriced.length)notes.push(next.unpriced.length+' 个模型暂无公开价格，token 已计入；费用暂未计入。');if(next.estPct)notes.push('≈ 表示采用估算 token 或参考费率。');if(next.sources?.cursor?.pending)notes.push('Cursor 估算仍在后台扫描，完成后自动更新。');if(next.errs?.length)notes.push('扫描异常：'+next.errs.join('；'));$('notes').textContent=notes.join(' ');$('status').textContent='更新于 '+new Date(next.at).toLocaleTimeString('zh-CN',{hour12:false})+' · '+next.machine+' · 扫描 '+next.scanMs+'ms';$('liveLabel').textContent=next.codex?.lastAt&&Date.now()-next.codex.lastAt<90000?'Codex 正在更新':'本机用量';select($('rangeTabs'),range);select($('dimensionTabs'),dimension)}
 async function load(refresh=false,animate=false){if(loading&&!refresh&&!animate)return;const id=++request;controller?.abort();controller=new AbortController();loading=true;if(refresh)$('refresh').classList.add('busy');try{const res=await fetch('/api?range='+range+(refresh?'&refresh=1':''),{signal:controller.signal});if(!res.ok)throw Error('HTTP '+res.status);const next=await res.json();if(id===request)render(next,animate)}catch(e){if(e.name!=='AbortError'&&id===request)$('status').textContent='读取失败：'+e.message+' · 点击刷新重试'}finally{if(id===request){loading=false;$('refresh').classList.remove('busy')}}}
-initTabs('rangeTabs',value=>{if(value===range)return;range=value;expanded=null;load(false,true)});initTabs('dimensionTabs',value=>{if(value===dimension)return;dimension=value;expanded=null;lastSignature='';if(data)renderList(true)});
+initTabs('rangeTabs',value=>{if(value===range)return;range=value;load(false,true)});initTabs('dimensionTabs',value=>{if(value===dimension)return;dimension=value;expanded=null;if(data){renderList();lastSignature=listSignature(data)}});
 $('refresh').onclick=()=>load(true,true);$('close').onclick=()=>post({hide:true});document.addEventListener('keydown',e=>{if(e.key==='Escape')post({hide:true})});
-$('config').onclick=async()=>{const open=$('settings').hidden;$('settings').hidden=!open;$('config').setAttribute('aria-pressed',open);if(open){await readSettings();$('settings').scrollIntoView({behavior:motion.matches?'instant':'smooth',block:'start'})}};
-function applySettings(ui){scale=Math.max(.8,Math.min(1.4,Number(ui.scale??scale)||1));glass=Math.max(.15,Math.min(.9,Number(ui.glass??glass)||.8));const n=Number(ui.blur??blur);blur=Number.isFinite(n)?Math.round(Math.max(0,Math.min(100,n))):50;$('scale').value=scale;$('glass').value=glass;$('blur').value=blur;$('scaleValue').textContent=Math.round(scale*100)+'%';$('glassValue').textContent=Math.round(glass*100)+'%';$('blurValue').textContent=blur+'%';document.documentElement.style.zoom=String(scale);const rgb=dark.matches?'22,25,31':'248,249,251';document.documentElement.style.setProperty('--surface','rgba('+rgb+','+glass+')');document.documentElement.style.setProperty('--glass-blur',(blur*.32)+'px');requestAnimationFrame(()=>{select($('rangeTabs'),range);select($('dimensionTabs'),dimension);chartDraw()})}
+$('config').onclick=async()=>{const open=$('settings').hidden;$('settings').hidden=!open;$('config').setAttribute('aria-pressed',open);if(open){await readSettings();if(!$('settings').hidden)$('settings').scrollIntoView({behavior:motion.matches?'instant':'smooth',block:'start'})}};
+function applySettings(ui){scale=Math.max(.8,Math.min(1.4,Number(ui.scale??scale)||1));glass=Math.max(.15,Math.min(.9,Number(ui.glass??glass)||.8));const n=Number(ui.blur??blur);blur=Number.isFinite(n)?Math.round(Math.max(0,Math.min(100,n))):50;$('scale').value=scale;$('glass').value=glass;$('blur').value=blur;$('scaleValue').textContent=Math.round(scale*100)+'%';$('glassValue').textContent=Math.round(glass*100)+'%';$('blurValue').textContent=blur+'%';document.documentElement.style.zoom=String(scale);const rgb=dark.matches?'22,25,31':'248,249,251';document.documentElement.style.setProperty('--surface','rgba('+rgb+','+glass+')');document.documentElement.style.setProperty('--glass-blur',(blur*.32)+'px');requestAnimationFrame(()=>{select($('rangeTabs'),range);select($('dimensionTabs'),dimension);chartDraw(chartProgress)})}
 async function readSettings(){try{const res=await fetch('/api/ui'),ui=await res.json();applySettings({...ui,blur:ui.blur??50});post({blur});$('sources').innerHTML='<div>数据来源（只读；修改配置后重启）</div>'+(ui.configFile?'<div class="source">配置文件：'+esc(ui.configFile)+'</div>':'')+ui.paths.map(p=>'<div class="source"><b>'+esc(p.name)+(p.enabled===false?' · 已禁用':p.exists===false?' · 路径不存在':p.exists===true?' · 已发现':'')+'</b><div>'+esc(p.path||'—')+'</div></div>').join('')}catch(e){$('status').textContent='设置读取失败：'+e.message}}
 function queueSave(){clearTimeout(saveTimer);saveTimer=setTimeout(async()=>{try{const res=await fetch('/api/ui',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({scale,glass,blur})});if(!res.ok)throw Error('HTTP '+res.status)}catch(e){$('status').textContent='设置保存失败：'+e.message}},200)}
 $('scale').oninput=e=>{applySettings({scale:Number(e.target.value),glass});post({scale});queueSave()};$('glass').oninput=e=>{applySettings({scale,glass:Number(e.target.value)});queueSave()};
